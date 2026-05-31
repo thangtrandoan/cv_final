@@ -132,6 +132,7 @@ def predict_with_tta(
     conf_threshold: float,
     nms_threshold: float,
     max_detections_per_image: int,
+    brightness_factors: list[float],
     device: torch.device,
 ) -> dict[str, object]:
     image = Image.open(image_path).convert("RGB")

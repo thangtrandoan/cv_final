@@ -21,6 +21,7 @@ EARLY_STOPPING_PATIENCE = 50
 MAP_CONF_THRESHOLD = 0.05
 MAP_NMS_THRESHOLD = 0.50
 MAP_MAX_DETECTIONS_PER_IMAGE = 100
+MODEL_TYPE = "fcos_resnet50_fpn"
 
 
 def format_duration(seconds: float) -> str:
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=MAP_MAX_DETECTIONS_PER_IMAGE,
     )
+    parser.add_argument("--eval_map_every", type=int, default=1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume_from_best", action="store_true")
     parser.add_argument("--resume_checkpoint", type=Path)
@@ -301,7 +303,7 @@ def save_checkpoint(
             "epoch": epoch,
             "best_val_loss": best_val_loss,
             "best_metric": best_metric,
-            "model_type": "fcos_resnet50_fpn",
+            "model_type": MODEL_TYPE,
         },
         path,
     )
@@ -321,6 +323,13 @@ def main() -> None:
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device)
+        checkpoint_model_type = checkpoint.get("model_type")
+        if checkpoint_model_type != MODEL_TYPE:
+            raise ValueError(
+                "Resume checkpoint is not compatible with the current model. "
+                f"checkpoint_model_type={checkpoint_model_type!r}, current_model_type={MODEL_TYPE!r}. "
+                "Train from scratch or resume from a checkpoint created by the current FCOS model."
+            )
 
     train_dataset = ObjectDetectionDataset(args.train_data, args.image_dir, img_size=args.img_size, train=True)
     val_dataset = ObjectDetectionDataset(args.val_data, args.val_image_dir, img_size=args.img_size, train=False)
@@ -384,16 +393,19 @@ def main() -> None:
     multi_scale_sizes = list(range(args.multi_scale_min, args.multi_scale_max + 1, 32))
     if not multi_scale_sizes:
         raise ValueError("Multi-scale range must include at least one size.")
+    if args.eval_map_every <= 0:
+        raise ValueError("--eval_map_every must be >= 1.")
     print(
         "Starting training "
         f"device={device} "
         f"epochs={args.epochs} "
         f"batch_size={args.batch_size} "
         f"gpus={gpu_count} "
-        f"architecture=fcos_resnet50_fpn "
+        f"architecture={MODEL_TYPE} "
         f"pretrained_backbone=True "
         f"multi_scale=True "
         f"eval_map=True "
+        f"eval_map_every={args.eval_map_every} "
         f"early_stopping_patience={args.early_stopping_patience} "
         f"train_images={len(train_dataset)} "
         f"val_images={len(val_dataset)} "
@@ -418,36 +430,39 @@ def main() -> None:
         scheduler.step()
 
         val_loss = val_metrics["loss"]
-        map_metrics = evaluate_map(
-            model=model,
-            dataloader=val_loader,
-            num_classes=len(train_dataset.class_names),
-            img_size=args.img_size,
-            device=device,
-            conf_threshold=args.map_conf_threshold,
-            nms_threshold=args.map_nms_threshold,
-            max_detections_per_image=args.map_max_detections_per_image,
-        )
-
-        improved = map_metrics["map_50"] > best_map
-        if improved:
-            best_val_loss = val_loss
-            best_map = map_metrics["map_50"]
-            epochs_without_improvement = 0
-            save_checkpoint(
-                best_path,
-                model,
-                optimizer,
-                scheduler,
-                train_dataset.class_names,
-                args.img_size,
-                args.img_size // 32,
-                epoch,
-                best_val_loss,
-                best_metric=best_map,
+        should_eval_map = epoch == start_epoch or epoch == end_epoch or epoch % args.eval_map_every == 0
+        map_metrics: dict[str, float] | None = None
+        if should_eval_map:
+            map_metrics = evaluate_map(
+                model=model,
+                dataloader=val_loader,
+                num_classes=len(train_dataset.class_names),
+                img_size=args.img_size,
+                device=device,
+                conf_threshold=args.map_conf_threshold,
+                nms_threshold=args.map_nms_threshold,
+                max_detections_per_image=args.map_max_detections_per_image,
             )
-        else:
-            epochs_without_improvement += 1
+
+            improved = map_metrics["map_50"] > best_map
+            if improved:
+                best_val_loss = val_loss
+                best_map = map_metrics["map_50"]
+                epochs_without_improvement = 0
+                save_checkpoint(
+                    best_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    train_dataset.class_names,
+                    args.img_size,
+                    args.img_size // 32,
+                    epoch,
+                    best_val_loss,
+                    best_metric=best_map,
+                )
+            else:
+                epochs_without_improvement += 1
 
         message = (
             f"epoch={epoch:03d} "
@@ -457,18 +472,21 @@ def main() -> None:
             f"val_obj_conf={val_metrics['obj_conf']:.4f} "
             f"val_noobj_conf={val_metrics['noobj_conf']:.4f}"
         )
-        message += (
-            f" val_mAP@0.5={map_metrics['map_50']:.4f} "
-            f"best_mAP@0.5={best_map:.4f} "
-            f"val_precision={map_metrics['micro_precision']:.4f} "
-            f"val_recall={map_metrics['micro_recall']:.4f} "
-            f"val_predictions={int(map_metrics['num_predictions'])} "
-            f"patience={epochs_without_improvement}/{args.early_stopping_patience} "
-            f"epoch_time={format_duration(time.perf_counter() - epoch_start_time)}"
-        )
+        if map_metrics is not None:
+            message += (
+                f" val_mAP@0.5={map_metrics['map_50']:.4f} "
+                f"best_mAP@0.5={best_map:.4f} "
+                f"val_precision={map_metrics['micro_precision']:.4f} "
+                f"val_recall={map_metrics['micro_recall']:.4f} "
+                f"val_predictions={int(map_metrics['num_predictions'])} "
+                f"patience={epochs_without_improvement}/{args.early_stopping_patience} evals"
+            )
+        else:
+            message += f" best_mAP@0.5={best_map:.4f} map_eval=skipped"
+        message += f" epoch_time={format_duration(time.perf_counter() - epoch_start_time)}"
         print(message)
 
-        if epochs_without_improvement >= args.early_stopping_patience:
+        if map_metrics is not None and epochs_without_improvement >= args.early_stopping_patience:
             print(
                 f"Early stopping at epoch={epoch:03d} "
                 f"best_mAP@0.5={best_map:.4f} "

@@ -37,6 +37,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lambda_noobj", type=float, default=2.0)
+    parser.add_argument("--multi_scale_min", type=int, default=MULTI_SCALE_MIN)
+    parser.add_argument("--multi_scale_max", type=int, default=MULTI_SCALE_MAX)
+    parser.add_argument("--early_stopping_patience", type=int, default=EARLY_STOPPING_PATIENCE)
+    parser.add_argument("--map_conf_threshold", type=float, default=MAP_CONF_THRESHOLD)
+    parser.add_argument("--map_nms_threshold", type=float, default=MAP_NMS_THRESHOLD)
+    parser.add_argument(
+        "--map_max_detections_per_image",
+        type=int,
+        default=MAP_MAX_DETECTIONS_PER_IMAGE,
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -324,7 +334,7 @@ def main() -> None:
     best_val_loss = float("inf")
     best_map = float("-inf")
     epochs_without_improvement = 0
-    multi_scale_sizes = list(range(MULTI_SCALE_MIN, MULTI_SCALE_MAX + 1, 32))
+    multi_scale_sizes = list(range(args.multi_scale_min, args.multi_scale_max + 1, 32))
     if not multi_scale_sizes:
         raise ValueError("Multi-scale range must include at least one size.")
     print(
@@ -337,7 +347,7 @@ def main() -> None:
         f"pretrained_backbone=True "
         f"multi_scale=True "
         f"eval_map=True "
-        f"early_stopping_patience={EARLY_STOPPING_PATIENCE} "
+        f"early_stopping_patience={args.early_stopping_patience} "
         f"train_images={len(train_dataset)} "
         f"val_images={len(val_dataset)} "
         f"checkpoint={best_path}",
@@ -367,9 +377,9 @@ def main() -> None:
             num_classes=len(train_dataset.class_names),
             img_size=args.img_size,
             device=device,
-            conf_threshold=MAP_CONF_THRESHOLD,
-            nms_threshold=MAP_NMS_THRESHOLD,
-            max_detections_per_image=MAP_MAX_DETECTIONS_PER_IMAGE,
+            conf_threshold=args.map_conf_threshold,
+            nms_threshold=args.map_nms_threshold,
+            max_detections_per_image=args.map_max_detections_per_image,
         )
 
         improved = map_metrics["map_50"] > best_map
@@ -407,11 +417,11 @@ def main() -> None:
             f"val_precision={map_metrics['micro_precision']:.4f} "
             f"val_recall={map_metrics['micro_recall']:.4f} "
             f"val_predictions={int(map_metrics['num_predictions'])} "
-            f"patience={epochs_without_improvement}/{EARLY_STOPPING_PATIENCE}"
+            f"patience={epochs_without_improvement}/{args.early_stopping_patience}"
         )
         print(message)
 
-        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+        if epochs_without_improvement >= args.early_stopping_patience:
             print(
                 f"Early stopping at epoch={epoch:03d} "
                 f"best_mAP@0.5={best_map:.4f} "

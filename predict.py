@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf_threshold", type=float, default=0.45)
     parser.add_argument("--nms_threshold", type=float, default=0.50)
     parser.add_argument("--max_detections_per_image", type=int, default=30)
+    parser.add_argument("--tta_brightness", nargs="*", type=float, default=TTA_BRIGHTNESS_FACTORS)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -101,6 +102,7 @@ def merge_boxes(
     class_names: list[str],
     nms_threshold: float,
     max_detections_per_image: int,
+    brightness_factors: list[float],
     device: torch.device,
 ) -> dict[str, object]:
     if not boxes:
@@ -138,7 +140,7 @@ def predict_with_tta(
 
     variants: list[tuple[Image.Image, bool]] = [(image, False)]
     variants.append((image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), True))
-    for factor in TTA_BRIGHTNESS_FACTORS:
+    for factor in brightness_factors:
         variants.append((ImageEnhance.Brightness(image).enhance(factor), False))
 
     for variant, flipped in variants:
@@ -181,6 +183,7 @@ def main() -> None:
         f"conf_threshold={args.conf_threshold} "
         f"max_detections_per_image={args.max_detections_per_image} "
         f"tta=True "
+        f"tta_brightness={args.tta_brightness} "
         f"output={args.output}",
         flush=True,
     )
@@ -214,6 +217,7 @@ def main() -> None:
             args.conf_threshold,
             args.nms_threshold,
             args.max_detections_per_image,
+            args.tta_brightness,
             device,
         )
         for image_path in image_paths

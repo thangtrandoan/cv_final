@@ -1,0 +1,64 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables and local config
+.env
+.env.*
+!.env.example
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Build/package artifacts
+build/
+dist/
+*.egg-info/
+
+# Test/coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML training artifacts
+checkpoints/
+runs/
+outputs/
+results/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# Large local archives/datasets
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+public/

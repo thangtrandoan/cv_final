@@ -70,7 +70,7 @@ def run_epoch(
 
 def save_checkpoint(
     path: Path,
-    model: TinyGridDetector,
+    model: torch.nn.Module,
     class_names: list[str],
     anchors: torch.Tensor,
     img_size: int,
@@ -78,9 +78,10 @@ def save_checkpoint(
     best_metric: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "class_names": class_names,
             "anchors": anchors.cpu().tolist(),
             "img_size": img_size,
@@ -116,6 +117,9 @@ def main() -> None:
 
     anchors = kmeans_anchors(args.train_data, k=3) if args.use_kmeans_anchors else DEFAULT_ANCHORS.clone()
     model = TinyGridDetector(num_classes=len(train_dataset.class_names), num_anchors=anchors.shape[0]).to(device)
+    gpu_count = torch.cuda.device_count() if device.type == "cuda" else 0
+    if gpu_count > 1:
+        model = torch.nn.DataParallel(model)
     class_weights = class_weights_from_dataset(train_dataset).to(device)
     criterion = DetectionLoss(
         anchors=anchors.to(device),
@@ -134,6 +138,7 @@ def main() -> None:
         f"device={device} "
         f"epochs={args.epochs} "
         f"batch_size={args.batch_size} "
+        f"gpus={gpu_count} "
         f"train_images={len(train_dataset)} "
         f"val_images={len(val_dataset)} "
         f"checkpoint={best_path}",

@@ -20,8 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--checkpoint", type=Path, default=Path("./models/best.pth"))
     parser.add_argument("--img_size", type=int, default=416)
-    parser.add_argument("--conf_threshold", type=float, default=0.20)
+    parser.add_argument("--conf_threshold", type=float, default=0.45)
     parser.add_argument("--nms_threshold", type=float, default=0.50)
+    parser.add_argument("--max_detections_per_image", type=int, default=100)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -42,6 +43,7 @@ def predict_image(
     img_size: int,
     conf_threshold: float,
     nms_threshold: float,
+    max_detections_per_image: int,
     device: torch.device,
 ) -> dict[str, object]:
     image = Image.open(image_path)
@@ -88,6 +90,7 @@ def predict_image(
             )
 
     output_boxes.sort(key=lambda item: item["confidence"], reverse=True)
+    output_boxes = output_boxes[:max_detections_per_image]
     return {"image_id": image_path.name, "boxes": output_boxes}
 
 
@@ -99,6 +102,8 @@ def main() -> None:
         f"device={device} "
         f"image_dir={args.image_dir} "
         f"checkpoint={args.checkpoint} "
+        f"conf_threshold={args.conf_threshold} "
+        f"max_detections_per_image={args.max_detections_per_image} "
         f"output={args.output}",
         flush=True,
     )
@@ -127,6 +132,7 @@ def main() -> None:
             img_size,
             args.conf_threshold,
             args.nms_threshold,
+            args.max_detections_per_image,
             device,
         )
         for image_path in image_paths

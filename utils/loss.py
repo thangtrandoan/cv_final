@@ -79,7 +79,7 @@ class DetectionLoss(nn.Module):
         num_classes: int = 5,
         lambda_box: float = 5.0,
         lambda_obj: float = 1.0,
-        lambda_noobj: float = 0.3,
+        lambda_noobj: float = 1.0,
         lambda_cls: float = 1.0,
         class_weights: torch.Tensor | None = None,
     ) -> None:
@@ -122,6 +122,9 @@ class DetectionLoss(nn.Module):
         noobj_loss = F.binary_cross_entropy_with_logits(
             obj_logits[no_object_mask], target[..., 4][no_object_mask], reduction="mean"
         )
+        with torch.no_grad():
+            object_conf = torch.sigmoid(obj_logits[object_mask]).mean() if object_mask.any() else raw.new_tensor(0.0)
+            no_object_conf = torch.sigmoid(obj_logits[no_object_mask]).mean()
 
         loss = (
             self.lambda_box * box_loss
@@ -135,5 +138,7 @@ class DetectionLoss(nn.Module):
             "obj_loss": float(obj_loss.detach().cpu()),
             "noobj_loss": float(noobj_loss.detach().cpu()),
             "cls_loss": float(cls_loss.detach().cpu()),
+            "obj_conf": float(object_conf.detach().cpu()),
+            "noobj_conf": float(no_object_conf.detach().cpu()),
         }
         return loss, metrics

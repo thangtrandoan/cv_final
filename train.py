@@ -24,8 +24,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--lambda_noobj", type=float, default=1.0)
     parser.add_argument("--use_kmeans_anchors", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--resume_from_best",
+        action="store_true",
+        help="Continue training from checkpoint_dir/best.pth.",
+    )
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=Path,
+        help="Continue training from a specific checkpoint path.",
+    )
     return parser.parse_args()
 
 
@@ -71,10 +82,14 @@ def run_epoch(
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     class_names: list[str],
     anchors: torch.Tensor,
     img_size: int,
     grid_size: int,
+    epoch: int,
+    best_val_loss: float,
     best_metric: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,10 +97,14 @@ def save_checkpoint(
     torch.save(
         {
             "model_state_dict": model_to_save.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "class_names": class_names,
             "anchors": anchors.cpu().tolist(),
             "img_size": img_size,
             "grid_size": grid_size,
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
             "best_metric": best_metric,
         },
         path,
@@ -95,6 +114,17 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    best_path = args.checkpoint_dir / "best.pth"
+    resume_path = args.resume_checkpoint
+    if args.resume_from_best:
+        resume_path = best_path
+    if args.resume_from_best and args.resume_checkpoint:
+        raise ValueError("Use either --resume_from_best or --resume_checkpoint, not both.")
+    checkpoint = None
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
 
     train_dataset = ObjectDetectionDataset(args.train_data, args.image_dir, img_size=args.img_size, train=True)
     val_dataset = ObjectDetectionDataset(args.val_data, args.val_image_dir, img_size=args.img_size, train=False)
@@ -115,8 +145,13 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    anchors = kmeans_anchors(args.train_data, k=3) if args.use_kmeans_anchors else DEFAULT_ANCHORS.clone()
+    if checkpoint is not None and "anchors" in checkpoint:
+        anchors = torch.tensor(checkpoint["anchors"], dtype=torch.float32)
+    else:
+        anchors = kmeans_anchors(args.train_data, k=3) if args.use_kmeans_anchors else DEFAULT_ANCHORS.clone()
     model = TinyGridDetector(num_classes=len(train_dataset.class_names), num_anchors=anchors.shape[0]).to(device)
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint["model_state_dict"])
     gpu_count = torch.cuda.device_count() if device.type == "cuda" else 0
     if gpu_count > 1:
         model = torch.nn.DataParallel(model)
@@ -127,12 +162,27 @@ def main() -> None:
         grid_size=args.img_size // 32,
         num_classes=len(train_dataset.class_names),
         class_weights=class_weights,
+        lambda_noobj=args.lambda_noobj,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
 
+    start_epoch = 1
     best_val_loss = float("inf")
-    best_path = args.checkpoint_dir / "best.pth"
+    if checkpoint is not None:
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_val_loss = float(checkpoint.get("best_val_loss", -checkpoint.get("best_metric", float("-inf"))))
+        print(
+            "Resuming training "
+            f"checkpoint={resume_path} "
+            f"start_epoch={start_epoch} "
+            f"best_val_loss={best_val_loss:.4f}",
+            flush=True,
+        )
     print(
         "Starting training "
         f"device={device} "
@@ -144,7 +194,8 @@ def main() -> None:
         f"checkpoint={best_path}",
         flush=True,
     )
-    for epoch in range(1, args.epochs + 1):
+    end_epoch = start_epoch + args.epochs - 1
+    for epoch in range(start_epoch, end_epoch + 1):
         train_metrics = run_epoch(model, train_loader, criterion, device, optimizer)
         with torch.no_grad():
             val_metrics = run_epoch(model, val_loader, criterion, device)
@@ -156,10 +207,14 @@ def main() -> None:
             save_checkpoint(
                 best_path,
                 model,
+                optimizer,
+                scheduler,
                 train_dataset.class_names,
                 anchors,
                 args.img_size,
                 args.img_size // 32,
+                epoch,
+                best_val_loss,
                 best_metric=-best_val_loss,
             )
 
@@ -167,7 +222,9 @@ def main() -> None:
             f"epoch={epoch:03d} "
             f"train_loss={train_metrics['loss']:.4f} "
             f"val_loss={val_metrics['loss']:.4f} "
-            f"best_val_loss={best_val_loss:.4f}"
+            f"best_val_loss={best_val_loss:.4f} "
+            f"val_obj_conf={val_metrics['obj_conf']:.4f} "
+            f"val_noobj_conf={val_metrics['noobj_conf']:.4f}"
         )
 
     print(f"Best checkpoint saved to {best_path}")

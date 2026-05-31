@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
         default=MAP_MAX_DETECTIONS_PER_IMAGE,
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--resume_from_best", action="store_true")
+    parser.add_argument("--resume_checkpoint", type=Path)
     return parser.parse_args()
 
 
@@ -301,6 +303,16 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
     best_path = args.checkpoint_dir / "best.pth"
+    resume_path = args.resume_checkpoint
+    if args.resume_from_best:
+        resume_path = best_path
+    if args.resume_from_best and args.resume_checkpoint:
+        raise ValueError("Use either --resume_from_best or --resume_checkpoint, not both.")
+    checkpoint = None
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
 
     train_dataset = ObjectDetectionDataset(args.train_data, args.image_dir, img_size=args.img_size, train=True)
     val_dataset = ObjectDetectionDataset(args.val_data, args.val_image_dir, img_size=args.img_size, train=False)
@@ -328,6 +340,8 @@ def main() -> None:
         pretrained_backbone=True,
     ).to(device)
     gpu_count = torch.cuda.device_count() if device.type == "cuda" else 0
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint["model_state_dict"])
     if gpu_count > 1:
         model = torch.nn.DataParallel(model)
     class_weights = class_weights_from_dataset(train_dataset).to(device)
@@ -346,6 +360,22 @@ def main() -> None:
     best_val_loss = float("inf")
     best_map = float("-inf")
     epochs_without_improvement = 0
+    if checkpoint is not None:
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+        best_map = float(checkpoint.get("best_metric", float("-inf")))
+        print(
+            "Resuming training "
+            f"checkpoint={resume_path} "
+            f"start_epoch={start_epoch} "
+            f"best_val_loss={best_val_loss:.4f} "
+            f"best_mAP@0.5={best_map:.4f}",
+            flush=True,
+        )
     multi_scale_sizes = list(range(args.multi_scale_min, args.multi_scale_max + 1, 32))
     if not multi_scale_sizes:
         raise ValueError("Multi-scale range must include at least one size.")

@@ -6,139 +6,207 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .anchors import anchor_iou_wh
+
+LEVEL_SPECS = {
+    "p3": {"stride": 8, "min_size": 0.0, "max_size": 96.0},
+    "p4": {"stride": 16, "min_size": 64.0, "max_size": 192.0},
+    "p5": {"stride": 32, "min_size": 128.0, "max_size": float("inf")},
+}
 
 
-def encode_targets(
+def focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    probs = torch.sigmoid(logits)
+    p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+    alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+    return alpha_t * (1.0 - p_t).pow(gamma) * bce
+
+
+def centerness_from_ltrb(ltrb: torch.Tensor) -> torch.Tensor:
+    left, top, right, bottom = ltrb.unbind(dim=-1)
+    lr = torch.minimum(left, right) / torch.maximum(left, right).clamp(min=1e-6)
+    tb = torch.minimum(top, bottom) / torch.maximum(top, bottom).clamp(min=1e-6)
+    return torch.sqrt((lr * tb).clamp(min=0.0, max=1.0))
+
+
+def iou_loss_from_ltrb(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    pred_left, pred_top, pred_right, pred_bottom = pred.unbind(dim=-1)
+    tgt_left, tgt_top, tgt_right, tgt_bottom = target.unbind(dim=-1)
+
+    inter_w = torch.minimum(pred_left, tgt_left) + torch.minimum(pred_right, tgt_right)
+    inter_h = torch.minimum(pred_top, tgt_top) + torch.minimum(pred_bottom, tgt_bottom)
+    inter = inter_w.clamp(min=0.0) * inter_h.clamp(min=0.0)
+
+    pred_area = (pred_left + pred_right).clamp(min=0.0) * (pred_top + pred_bottom).clamp(min=0.0)
+    target_area = (tgt_left + tgt_right).clamp(min=0.0) * (tgt_top + tgt_bottom).clamp(min=0.0)
+    union = pred_area + target_area - inter
+    iou = inter / union.clamp(min=1e-6)
+    return -torch.log(iou.clamp(min=1e-6))
+
+
+def encode_fcos_targets(
+    outputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     targets: list[list[dict[str, Any]]],
-    anchors: torch.Tensor,
     img_size: int,
-    grid_size: int,
     num_classes: int,
     device: torch.device,
-) -> torch.Tensor:
-    batch_size = len(targets)
-    num_anchors = anchors.shape[0]
-    encoded = torch.zeros((batch_size, grid_size, grid_size, num_anchors, 6), device=device)
-    anchors = anchors.to(device)
+) -> dict[str, dict[str, torch.Tensor]]:
+    encoded: dict[str, dict[str, torch.Tensor]] = {}
+    for level, (cls_logits, _, _) in outputs.items():
+        batch_size, _, height, width = cls_logits.shape
+        stride = LEVEL_SPECS[level]["stride"]
+        cls_target = torch.zeros((batch_size, num_classes, height, width), device=device)
+        reg_target = torch.zeros((batch_size, 4, height, width), device=device)
+        cnt_target = torch.zeros((batch_size, 1, height, width), device=device)
+        pos_mask = torch.zeros((batch_size, 1, height, width), dtype=torch.bool, device=device)
+        area_target = torch.full((batch_size, 1, height, width), float("inf"), device=device)
 
-    for batch_idx, image_targets in enumerate(targets):
-        for item in image_targets:
-            xmin, ymin, xmax, ymax = [float(value) for value in item["bbox"]]
-            cx = ((xmin + xmax) / 2.0) / img_size
-            cy = ((ymin + ymax) / 2.0) / img_size
-            bw = max(1e-6, (xmax - xmin) / img_size)
-            bh = max(1e-6, (ymax - ymin) / img_size)
-            if bw <= 0 or bh <= 0:
-                continue
+        shifts_x = (torch.arange(width, device=device, dtype=torch.float32) + 0.5) * stride
+        shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride
+        yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
 
-            grid_x = min(grid_size - 1, max(0, int(cx * grid_size)))
-            grid_y = min(grid_size - 1, max(0, int(cy * grid_size)))
-            box_wh = torch.tensor([[bw, bh]], dtype=torch.float32, device=device)
-            anchor_idx = int(anchor_iou_wh(box_wh, anchors).squeeze(0).argmax().item())
+        for batch_idx, image_targets in enumerate(targets):
+            for item in image_targets:
+                xmin, ymin, xmax, ymax = [float(value) for value in item["bbox"]]
+                box_w = xmax - xmin
+                box_h = ymax - ymin
+                if box_w <= 0 or box_h <= 0:
+                    continue
+                max_side = max(box_w, box_h)
+                if max_side < LEVEL_SPECS[level]["min_size"] or max_side > LEVEL_SPECS[level]["max_size"]:
+                    continue
 
-            encoded[batch_idx, grid_y, grid_x, anchor_idx, 0:4] = torch.tensor(
-                [cx, cy, bw, bh], dtype=torch.float32, device=device
-            )
-            encoded[batch_idx, grid_y, grid_x, anchor_idx, 4] = 1.0
-            encoded[batch_idx, grid_y, grid_x, anchor_idx, 5] = int(item["class_id"])
+                left = xx - xmin
+                top = yy - ymin
+                right = xmax - xx
+                bottom = ymax - yy
+                inside_box = (left > 0) & (top > 0) & (right > 0) & (bottom > 0)
 
+                cx = (xmin + xmax) * 0.5
+                cy = (ymin + ymax) * 0.5
+                radius = 1.5 * stride
+                inside_center = (
+                    (xx >= max(xmin, cx - radius))
+                    & (xx <= min(xmax, cx + radius))
+                    & (yy >= max(ymin, cy - radius))
+                    & (yy <= min(ymax, cy + radius))
+                )
+                candidate = inside_box & inside_center
+                if not candidate.any():
+                    grid_x = min(width - 1, max(0, int(cx / stride)))
+                    grid_y = min(height - 1, max(0, int(cy / stride)))
+                    candidate = torch.zeros((height, width), dtype=torch.bool, device=device)
+                    candidate[grid_y, grid_x] = True
+
+                area = box_w * box_h
+                update = candidate & (area < area_target[batch_idx, 0])
+                if not update.any():
+                    continue
+
+                class_id = int(item["class_id"])
+                cls_target[batch_idx, :, update] = 0.0
+                cls_target[batch_idx, class_id, update] = 1.0
+                ltrb = torch.stack((left, top, right, bottom), dim=0) / stride
+                reg_target[batch_idx, :, update] = ltrb[:, update]
+                cnt_target[batch_idx, 0, update] = centerness_from_ltrb(ltrb.permute(1, 2, 0)[update])
+                pos_mask[batch_idx, 0, update] = True
+                area_target[batch_idx, 0, update] = area
+
+        encoded[level] = {
+            "cls": cls_target,
+            "reg": reg_target,
+            "cnt": cnt_target,
+            "pos_mask": pos_mask,
+        }
     return encoded
-
-
-def decode_raw_predictions(raw: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
-    batch_size, _, grid_size, _ = raw.shape
-    num_anchors = anchors.shape[0]
-    num_classes = raw.shape[1] // num_anchors - 5
-    pred = raw.view(batch_size, num_anchors, 5 + num_classes, grid_size, grid_size)
-    pred = pred.permute(0, 3, 4, 1, 2).contiguous()
-
-    device = raw.device
-    grid_y, grid_x = torch.meshgrid(
-        torch.arange(grid_size, device=device),
-        torch.arange(grid_size, device=device),
-        indexing="ij",
-    )
-    grid_x = grid_x.view(1, grid_size, grid_size, 1)
-    grid_y = grid_y.view(1, grid_size, grid_size, 1)
-    anchors = anchors.to(device).view(1, 1, 1, num_anchors, 2)
-
-    xy = torch.empty_like(pred[..., 0:2])
-    xy[..., 0] = (torch.sigmoid(pred[..., 0]) + grid_x) / grid_size
-    xy[..., 1] = (torch.sigmoid(pred[..., 1]) + grid_y) / grid_size
-    wh = anchors * torch.exp(pred[..., 2:4]).clamp(max=4.0)
-    return torch.cat((xy, wh, pred[..., 4:]), dim=-1)
 
 
 class DetectionLoss(nn.Module):
     def __init__(
         self,
-        anchors: torch.Tensor,
+        anchors: torch.Tensor | None = None,
         img_size: int = 416,
         grid_size: int = 13,
         num_classes: int = 5,
-        lambda_box: float = 5.0,
+        lambda_box: float = 2.0,
         lambda_obj: float = 1.0,
         lambda_noobj: float = 1.0,
         lambda_cls: float = 1.0,
         class_weights: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
-        self.register_buffer("anchors", anchors.float())
         self.img_size = img_size
         self.grid_size = grid_size
         self.num_classes = num_classes
         self.lambda_box = lambda_box
         self.lambda_obj = lambda_obj
-        self.lambda_noobj = lambda_noobj
         self.lambda_cls = lambda_cls
-        self.register_buffer("class_weights", class_weights.float() if class_weights is not None else torch.ones(num_classes))
 
-    def forward(self, raw: torch.Tensor, targets: list[list[dict[str, Any]]]) -> tuple[torch.Tensor, dict[str, float]]:
-        target = encode_targets(
-            targets,
-            self.anchors,
-            self.img_size,
-            self.grid_size,
-            self.num_classes,
-            raw.device,
-        )
-        pred = decode_raw_predictions(raw, self.anchors)
+    def forward(
+        self,
+        outputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        targets: list[list[dict[str, Any]]],
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        encoded = encode_fcos_targets(outputs, targets, self.img_size, self.num_classes, next(iter(outputs.values()))[0].device)
 
-        object_mask = target[..., 4] == 1
-        no_object_mask = ~object_mask
+        total_cls_loss = next(iter(outputs.values()))[0].sum() * 0.0
+        total_box_loss = total_cls_loss.clone()
+        total_cnt_loss = total_cls_loss.clone()
+        total_pos = 0
+        total_locations = 0
+        pos_cnt_values = []
+        neg_cls_scores = []
 
-        if object_mask.any():
-            box_loss = F.smooth_l1_loss(pred[..., 0:4][object_mask], target[..., 0:4][object_mask], reduction="mean")
-            class_logits = pred[..., 5:][object_mask]
-            class_targets = target[..., 5][object_mask].long()
-            cls_loss = F.cross_entropy(class_logits, class_targets, weight=self.class_weights.to(raw.device))
-        else:
-            box_loss = raw.sum() * 0.0
-            cls_loss = raw.sum() * 0.0
+        for level, (cls_logits, reg_preds, cnt_logits) in outputs.items():
+            target = encoded[level]
+            cls_target = target["cls"]
+            reg_target = target["reg"]
+            cnt_target = target["cnt"]
+            pos_mask = target["pos_mask"]
+            num_pos = int(pos_mask.sum().item())
+            total_pos += num_pos
+            total_locations += pos_mask.numel()
 
-        obj_logits = pred[..., 4]
-        obj_loss = F.binary_cross_entropy_with_logits(obj_logits[object_mask], target[..., 4][object_mask], reduction="mean") if object_mask.any() else raw.sum() * 0.0
-        noobj_loss = F.binary_cross_entropy_with_logits(
-            obj_logits[no_object_mask], target[..., 4][no_object_mask], reduction="mean"
-        )
-        with torch.no_grad():
-            object_conf = torch.sigmoid(obj_logits[object_mask]).mean() if object_mask.any() else raw.new_tensor(0.0)
-            no_object_conf = torch.sigmoid(obj_logits[no_object_mask]).mean()
+            cls_loss = focal_loss(cls_logits, cls_target).sum() / max(num_pos, 1)
+            total_cls_loss = total_cls_loss + cls_loss
 
-        loss = (
-            self.lambda_box * box_loss
-            + self.lambda_obj * obj_loss
-            + self.lambda_noobj * noobj_loss
-            + self.lambda_cls * cls_loss
-        )
+            if num_pos:
+                pos = pos_mask.squeeze(1)
+                pred_ltrb = reg_preds.permute(0, 2, 3, 1)[pos]
+                target_ltrb = reg_target.permute(0, 2, 3, 1)[pos]
+                cnt_weights = cnt_target.squeeze(1)[pos].detach()
+                box_loss = (iou_loss_from_ltrb(pred_ltrb, target_ltrb) * cnt_weights).sum() / cnt_weights.sum().clamp(min=1.0)
+                cnt_loss = F.binary_cross_entropy_with_logits(cnt_logits.squeeze(1)[pos], cnt_target.squeeze(1)[pos], reduction="mean")
+                pos_cnt_values.append(torch.sigmoid(cnt_logits.squeeze(1)[pos]).detach())
+            else:
+                box_loss = reg_preds.sum() * 0.0
+                cnt_loss = cnt_logits.sum() * 0.0
+
+            total_box_loss = total_box_loss + box_loss
+            total_cnt_loss = total_cnt_loss + cnt_loss
+            neg_cls_scores.append(torch.sigmoid(cls_logits[~pos_mask.expand_as(cls_logits)]).detach())
+
+        loss = self.lambda_cls * total_cls_loss + self.lambda_box * total_box_loss + self.lambda_obj * total_cnt_loss
+        pos_conf = torch.cat(pos_cnt_values).mean() if pos_cnt_values else loss.new_tensor(0.0)
+        neg_conf = torch.cat(neg_cls_scores).mean() if neg_cls_scores else loss.new_tensor(0.0)
         metrics = {
             "loss": float(loss.detach().cpu()),
-            "box_loss": float(box_loss.detach().cpu()),
-            "obj_loss": float(obj_loss.detach().cpu()),
-            "noobj_loss": float(noobj_loss.detach().cpu()),
-            "cls_loss": float(cls_loss.detach().cpu()),
-            "obj_conf": float(object_conf.detach().cpu()),
-            "noobj_conf": float(no_object_conf.detach().cpu()),
+            "box_loss": float(total_box_loss.detach().cpu()),
+            "obj_loss": float(total_cnt_loss.detach().cpu()),
+            "noobj_loss": float(total_cls_loss.detach().cpu()),
+            "cls_loss": float(total_cls_loss.detach().cpu()),
+            "obj_conf": float(pos_conf.detach().cpu()),
+            "noobj_conf": float(neg_conf.detach().cpu()),
+            "num_pos": float(total_pos),
+            "pos_ratio": float(total_pos / max(total_locations, 1)),
         }
         return loss, metrics
+
+
+def decode_raw_predictions(*args: Any, **kwargs: Any) -> torch.Tensor:
+    raise RuntimeError("FCOS model outputs are decoded directly in predict.py/train.py.")

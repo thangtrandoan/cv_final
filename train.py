@@ -10,10 +10,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from models.detector import TinyGridDetector
-from utils.anchors import kmeans_anchors
-from utils.box_ops import cxcywh_to_xyxy
 from utils.dataset import ObjectDetectionDataset, collate_fn
-from utils.loss import DetectionLoss, decode_raw_predictions
+from utils.loss import DetectionLoss, LEVEL_SPECS
 from utils.nms import nms
 
 
@@ -43,9 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_dir", required=True, type=Path)
     parser.add_argument("--val_image_dir", required=True, type=Path)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models/"))
-    parser.add_argument("--img_size", type=int, default=416)
+    parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lambda_noobj", type=float, default=2.0)
@@ -138,7 +136,6 @@ def run_epoch(
 def evaluate_map(
     model: torch.nn.Module,
     dataloader: DataLoader,
-    anchors: torch.Tensor,
     num_classes: int,
     img_size: int,
     device: torch.device,
@@ -148,7 +145,6 @@ def evaluate_map(
     iou_threshold: float = 0.5,
 ) -> dict[str, float]:
     model.eval()
-    anchors = anchors.to(device)
     gt_by_class: dict[int, dict[int, list[dict[str, object]]]] = {
         class_id: {} for class_id in range(num_classes)
     }
@@ -157,8 +153,7 @@ def evaluate_map(
 
     for images, targets in dataloader:
         images = images.to(device)
-        raw = model(images)
-        decoded = decode_raw_predictions(raw, anchors)
+        outputs = model(images)
 
         for batch_idx, image_targets in enumerate(targets):
             current_image_index = image_index + batch_idx
@@ -169,36 +164,50 @@ def evaluate_map(
                     {"bbox": torch.tensor([xmin, ymin, xmax, ymax]), "matched": False}
                 )
 
-            image_pred = decoded[batch_idx]
-            boxes_cxcywh = image_pred[..., 0:4].reshape(-1, 4)
-            object_scores = torch.sigmoid(image_pred[..., 4].reshape(-1))
-            class_probs = F.softmax(image_pred[..., 5:].reshape(-1, num_classes), dim=1)
-            class_scores, class_ids = class_probs.max(dim=1)
-            scores = object_scores * class_scores
-
-            keep = scores >= conf_threshold
-            boxes_cxcywh = boxes_cxcywh[keep]
-            scores = scores[keep]
-            class_ids = class_ids[keep]
-            if boxes_cxcywh.numel() == 0:
-                continue
-
-            boxes = cxcywh_to_xyxy(boxes_cxcywh).clamp(0.0, 1.0)
             image_predictions: list[dict[str, object]] = []
-            for class_id in class_ids.unique():
-                class_mask = class_ids == class_id
-                selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
-                for box, score in zip(boxes[class_mask][selected], scores[class_mask][selected]):
-                    if box[2] <= box[0] or box[3] <= box[1]:
-                        continue
-                    image_predictions.append(
-                        {
-                            "image_id": current_image_index,
-                            "class_id": int(class_id.item()),
-                            "confidence": float(score.item()),
-                            "bbox": box.detach().cpu(),
-                        }
-                    )
+            for level, (cls_logits, reg_preds, cnt_logits) in outputs.items():
+                stride = LEVEL_SPECS[level]["stride"]
+                cls_scores = torch.sigmoid(cls_logits[batch_idx])
+                cnt_scores = torch.sigmoid(cnt_logits[batch_idx])
+                scores_per_class = torch.sqrt((cls_scores * cnt_scores).clamp(min=0.0))
+                scores, class_ids = scores_per_class.reshape(num_classes, -1).max(dim=0)
+                keep = scores >= conf_threshold
+                if not keep.any():
+                    continue
+
+                _, height, width = cls_logits.shape[1:]
+                shifts_x = (torch.arange(width, device=device, dtype=torch.float32) + 0.5) * stride / img_size
+                shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride / img_size
+                yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
+                points = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+                distances = reg_preds[batch_idx].permute(1, 2, 0).reshape(-1, 4) * stride / img_size
+                boxes = torch.stack(
+                    (
+                        points[:, 0] - distances[:, 0],
+                        points[:, 1] - distances[:, 1],
+                        points[:, 0] + distances[:, 2],
+                        points[:, 1] + distances[:, 3],
+                    ),
+                    dim=1,
+                ).clamp(0.0, 1.0)
+
+                boxes = boxes[keep]
+                scores = scores[keep]
+                class_ids = class_ids[keep]
+                for class_id in class_ids.unique():
+                    class_mask = class_ids == class_id
+                    selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
+                    for box, score in zip(boxes[class_mask][selected], scores[class_mask][selected]):
+                        if box[2] <= box[0] or box[3] <= box[1]:
+                            continue
+                        image_predictions.append(
+                            {
+                                "image_id": current_image_index,
+                                "class_id": int(class_id.item()),
+                                "confidence": float(score.item()),
+                                "bbox": box.detach().cpu(),
+                            }
+                        )
 
             image_predictions.sort(key=lambda item: float(item["confidence"]), reverse=True)
             for pred in image_predictions[:max_detections_per_image]:
@@ -273,7 +282,6 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     class_names: list[str],
-    anchors: torch.Tensor,
     img_size: int,
     grid_size: int,
     epoch: int,
@@ -288,12 +296,12 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "class_names": class_names,
-            "anchors": anchors.cpu().tolist(),
             "img_size": img_size,
             "grid_size": grid_size,
             "epoch": epoch,
             "best_val_loss": best_val_loss,
             "best_metric": best_metric,
+            "model_type": "fcos_resnet50_fpn",
         },
         path,
     )
@@ -333,10 +341,8 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    anchors = kmeans_anchors(args.train_data, k=3)
     model = TinyGridDetector(
         num_classes=len(train_dataset.class_names),
-        num_anchors=anchors.shape[0],
         pretrained_backbone=True,
     ).to(device)
     gpu_count = torch.cuda.device_count() if device.type == "cuda" else 0
@@ -346,7 +352,6 @@ def main() -> None:
         model = torch.nn.DataParallel(model)
     class_weights = class_weights_from_dataset(train_dataset).to(device)
     criterion = DetectionLoss(
-        anchors=anchors.to(device),
         img_size=args.img_size,
         grid_size=args.img_size // 32,
         num_classes=len(train_dataset.class_names),
@@ -385,7 +390,7 @@ def main() -> None:
         f"epochs={args.epochs} "
         f"batch_size={args.batch_size} "
         f"gpus={gpu_count} "
-        f"architecture=resnet50 "
+        f"architecture=fcos_resnet50_fpn "
         f"pretrained_backbone=True "
         f"multi_scale=True "
         f"eval_map=True "
@@ -416,7 +421,6 @@ def main() -> None:
         map_metrics = evaluate_map(
             model=model,
             dataloader=val_loader,
-            anchors=anchors,
             num_classes=len(train_dataset.class_names),
             img_size=args.img_size,
             device=device,
@@ -436,7 +440,6 @@ def main() -> None:
                 optimizer,
                 scheduler,
                 train_dataset.class_names,
-                anchors,
                 args.img_size,
                 args.img_size // 32,
                 epoch,

@@ -5,13 +5,16 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 from models.detector import TinyGridDetector
 from utils.box_ops import cxcywh_to_xyxy
 from utils.json_utils import write_json
 from utils.loss import decode_raw_predictions
 from utils.nms import nms
+
+
+TTA_BRIGHTNESS_FACTORS = [0.85, 1.15]
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_size", type=int, default=416)
     parser.add_argument("--conf_threshold", type=float, default=0.45)
     parser.add_argument("--nms_threshold", type=float, default=0.50)
-    parser.add_argument("--max_detections_per_image", type=int, default=100)
+    parser.add_argument("--max_detections_per_image", type=int, default=30)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -37,16 +40,15 @@ def image_to_tensor(image: Image.Image, img_size: int) -> torch.Tensor:
 @torch.no_grad()
 def predict_image(
     model: TinyGridDetector,
-    image_path: Path,
+    image: Image.Image,
+    image_id: str,
     class_names: list[str],
     anchors: torch.Tensor,
     img_size: int,
     conf_threshold: float,
     nms_threshold: float,
-    max_detections_per_image: int,
     device: torch.device,
 ) -> dict[str, object]:
-    image = Image.open(image_path)
     original_w, original_h = image.size
     tensor = image_to_tensor(image, img_size).to(device)
     raw = model(tensor)
@@ -63,7 +65,7 @@ def predict_image(
     scores = scores[keep]
     class_ids = class_ids[keep]
     if boxes_cxcywh.numel() == 0:
-        return {"image_id": image_path.name, "boxes": []}
+        return {"image_id": image_id, "boxes": []}
 
     boxes = cxcywh_to_xyxy(boxes_cxcywh)
     scale = torch.tensor([original_w, original_h, original_w, original_h], device=device, dtype=torch.float32)
@@ -90,8 +92,82 @@ def predict_image(
             )
 
     output_boxes.sort(key=lambda item: item["confidence"], reverse=True)
-    output_boxes = output_boxes[:max_detections_per_image]
-    return {"image_id": image_path.name, "boxes": output_boxes}
+    return {"image_id": image_id, "boxes": output_boxes}
+
+
+def merge_boxes(
+    image_id: str,
+    boxes: list[dict[str, object]],
+    class_names: list[str],
+    nms_threshold: float,
+    max_detections_per_image: int,
+    device: torch.device,
+) -> dict[str, object]:
+    if not boxes:
+        return {"image_id": image_id, "boxes": []}
+
+    merged: list[dict[str, object]] = []
+    for class_name in class_names:
+        class_boxes = [box for box in boxes if box["class"] == class_name]
+        if not class_boxes:
+            continue
+        box_tensor = torch.tensor([box["bbox"] for box in class_boxes], dtype=torch.float32, device=device)
+        score_tensor = torch.tensor([box["confidence"] for box in class_boxes], dtype=torch.float32, device=device)
+        selected = nms(box_tensor, score_tensor, nms_threshold)
+        for index in selected.tolist():
+            merged.append(class_boxes[index])
+
+    merged.sort(key=lambda item: item["confidence"], reverse=True)
+    return {"image_id": image_id, "boxes": merged[:max_detections_per_image]}
+
+
+def predict_with_tta(
+    model: TinyGridDetector,
+    image_path: Path,
+    class_names: list[str],
+    anchors: torch.Tensor,
+    img_size: int,
+    conf_threshold: float,
+    nms_threshold: float,
+    max_detections_per_image: int,
+    device: torch.device,
+) -> dict[str, object]:
+    image = Image.open(image_path).convert("RGB")
+    original_w, _ = image.size
+    all_boxes: list[dict[str, object]] = []
+
+    variants: list[tuple[Image.Image, bool]] = [(image, False)]
+    variants.append((image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), True))
+    for factor in TTA_BRIGHTNESS_FACTORS:
+        variants.append((ImageEnhance.Brightness(image).enhance(factor), False))
+
+    for variant, flipped in variants:
+        prediction = predict_image(
+            model,
+            variant,
+            image_path.name,
+            class_names,
+            anchors,
+            img_size,
+            conf_threshold,
+            nms_threshold,
+            device,
+        )
+        for box in prediction["boxes"]:
+            box = dict(box)
+            if flipped:
+                xmin, ymin, xmax, ymax = box["bbox"]
+                box["bbox"] = [round(original_w - xmax, 2), ymin, round(original_w - xmin, 2), ymax]
+            all_boxes.append(box)
+
+    return merge_boxes(
+        image_path.name,
+        all_boxes,
+        class_names,
+        nms_threshold,
+        max_detections_per_image,
+        device,
+    )
 
 
 def main() -> None:
@@ -104,6 +180,7 @@ def main() -> None:
         f"checkpoint={args.checkpoint} "
         f"conf_threshold={args.conf_threshold} "
         f"max_detections_per_image={args.max_detections_per_image} "
+        f"tta=True "
         f"output={args.output}",
         flush=True,
     )
@@ -112,7 +189,11 @@ def main() -> None:
     anchors = torch.tensor(checkpoint["anchors"], dtype=torch.float32, device=device)
     img_size = int(checkpoint.get("img_size", args.img_size))
 
-    model = TinyGridDetector(num_classes=len(class_names), num_anchors=anchors.shape[0]).to(device)
+    model = TinyGridDetector(
+        num_classes=len(class_names),
+        num_anchors=anchors.shape[0],
+        pretrained_backbone=False,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -124,7 +205,7 @@ def main() -> None:
         ]
     )
     predictions = [
-        predict_image(
+        predict_with_tta(
             model,
             image_path,
             class_names,

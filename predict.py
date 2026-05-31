@@ -102,7 +102,6 @@ def merge_boxes(
     class_names: list[str],
     nms_threshold: float,
     max_detections_per_image: int,
-    brightness_factors: list[float],
     device: torch.device,
 ) -> dict[str, object]:
     if not boxes:

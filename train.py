@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from pathlib import Path
 
 import torch
@@ -22,6 +23,17 @@ EARLY_STOPPING_PATIENCE = 50
 MAP_CONF_THRESHOLD = 0.05
 MAP_NMS_THRESHOLD = 0.50
 MAP_MAX_DETECTIONS_PER_IMAGE = 100
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 def parse_args() -> argparse.Namespace:
@@ -355,6 +367,7 @@ def main() -> None:
     )
     end_epoch = start_epoch + args.epochs - 1
     for epoch in range(start_epoch, end_epoch + 1):
+        epoch_start_time = time.perf_counter()
         current_img_size = random.choice(multi_scale_sizes)
         train_dataset.transform.img_size = current_img_size
         criterion.img_size = current_img_size
@@ -417,7 +430,8 @@ def main() -> None:
             f"val_precision={map_metrics['micro_precision']:.4f} "
             f"val_recall={map_metrics['micro_recall']:.4f} "
             f"val_predictions={int(map_metrics['num_predictions'])} "
-            f"patience={epochs_without_improvement}/{args.early_stopping_patience}"
+            f"patience={epochs_without_improvement}/{args.early_stopping_patience} "
+            f"epoch_time={format_duration(time.perf_counter() - epoch_start_time)}"
         )
         print(message)
 

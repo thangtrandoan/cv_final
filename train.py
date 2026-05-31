@@ -21,6 +21,8 @@ EARLY_STOPPING_PATIENCE = 50
 MAP_CONF_THRESHOLD = 0.05
 MAP_NMS_THRESHOLD = 0.50
 MAP_MAX_DETECTIONS_PER_IMAGE = 100
+MAP_PRE_NMS_TOPK = 1000
+EVAL_MAP_EVERY = 3
 MODEL_TYPE = "fcos_resnet50_fpn"
 
 
@@ -58,7 +60,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=MAP_MAX_DETECTIONS_PER_IMAGE,
     )
-    parser.add_argument("--eval_map_every", type=int, default=1)
+    parser.add_argument("--map_pre_nms_topk", type=int, default=MAP_PRE_NMS_TOPK)
+    parser.add_argument("--eval_map_every", type=int, default=EVAL_MAP_EVERY)
+    parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--no_channels_last", action="store_true")
+    parser.add_argument("--single_gpu", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume_from_best", action="store_true")
     parser.add_argument("--resume_checkpoint", type=Path)
@@ -110,6 +116,9 @@ def run_epoch(
     criterion: DetectionLoss,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
+    scaler: torch.amp.GradScaler | None = None,
+    use_amp: bool = False,
+    channels_last: bool = False,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -117,15 +126,25 @@ def run_epoch(
     batches = 0
 
     for images, targets in dataloader:
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
+        if channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
         if training:
             optimizer.zero_grad(set_to_none=True)
-        raw = model(images)
-        loss, metrics = criterion(raw, targets)
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            raw = model(images)
+            loss, metrics = criterion(raw, targets)
         if training:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
+            if scaler is not None and use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
 
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -144,6 +163,7 @@ def evaluate_map(
     conf_threshold: float,
     nms_threshold: float,
     max_detections_per_image: int,
+    pre_nms_topk: int,
     iou_threshold: float = 0.5,
 ) -> dict[str, float]:
     model.eval()
@@ -152,9 +172,10 @@ def evaluate_map(
     }
     pred_by_class: dict[int, list[dict[str, object]]] = {class_id: [] for class_id in range(num_classes)}
     image_index = 0
+    points_cache: dict[tuple[str, int, int], torch.Tensor] = {}
 
     for images, targets in dataloader:
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
         outputs = model(images)
 
         for batch_idx, image_targets in enumerate(targets):
@@ -178,10 +199,13 @@ def evaluate_map(
                     continue
 
                 _, height, width = cls_logits.shape[1:]
-                shifts_x = (torch.arange(width, device=device, dtype=torch.float32) + 0.5) * stride / img_size
-                shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride / img_size
-                yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
-                points = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+                cache_key = (level, height, width)
+                if cache_key not in points_cache:
+                    shifts_x = (torch.arange(width, device=device, dtype=torch.float32) + 0.5) * stride / img_size
+                    shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride / img_size
+                    yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
+                    points_cache[cache_key] = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+                points = points_cache[cache_key]
                 distances = reg_preds[batch_idx].permute(1, 2, 0).reshape(-1, 4) * stride / img_size
                 boxes = torch.stack(
                     (
@@ -196,6 +220,10 @@ def evaluate_map(
                 boxes = boxes[keep]
                 scores = scores[keep]
                 class_ids = class_ids[keep]
+                if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
+                    scores, topk_indices = scores.topk(pre_nms_topk)
+                    boxes = boxes[topk_indices]
+                    class_ids = class_ids[topk_indices]
                 for class_id in class_ids.unique():
                     class_mask = class_ids == class_id
                     selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
@@ -312,6 +340,12 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    use_amp = device.type == "cuda" and not args.no_amp
+    channels_last = device.type == "cuda" and not args.no_channels_last
     best_path = args.checkpoint_dir / "best.pth"
     resume_path = args.resume_checkpoint
     if args.resume_from_best:
@@ -333,31 +367,37 @@ def main() -> None:
 
     train_dataset = ObjectDetectionDataset(args.train_data, args.image_dir, img_size=args.img_size, train=True)
     val_dataset = ObjectDetectionDataset(args.val_data, args.val_image_dir, img_size=args.img_size, train=False)
+    loader_options = {
+        "num_workers": args.num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": args.num_workers > 0,
+    }
+    if args.num_workers > 0:
+        loader_options["prefetch_factor"] = 2
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=device.type == "cuda",
+        **loader_options,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=device.type == "cuda",
+        **loader_options,
     )
 
     model = TinyGridDetector(
         num_classes=len(train_dataset.class_names),
         pretrained_backbone=True,
     ).to(device)
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
     gpu_count = torch.cuda.device_count() if device.type == "cuda" else 0
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model_state_dict"])
-    if gpu_count > 1:
+    if gpu_count > 1 and not args.single_gpu:
         model = torch.nn.DataParallel(model)
     class_weights = class_weights_from_dataset(train_dataset).to(device)
     criterion = DetectionLoss(
@@ -369,6 +409,7 @@ def main() -> None:
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     start_epoch = 1
     best_val_loss = float("inf")
@@ -401,11 +442,15 @@ def main() -> None:
         f"epochs={args.epochs} "
         f"batch_size={args.batch_size} "
         f"gpus={gpu_count} "
+        f"single_gpu={args.single_gpu} "
         f"architecture={MODEL_TYPE} "
         f"pretrained_backbone=True "
         f"multi_scale=True "
         f"eval_map=True "
         f"eval_map_every={args.eval_map_every} "
+        f"amp={use_amp} "
+        f"channels_last={channels_last} "
+        f"map_pre_nms_topk={args.map_pre_nms_topk} "
         f"early_stopping_patience={args.early_stopping_patience} "
         f"train_images={len(train_dataset)} "
         f"val_images={len(val_dataset)} "
@@ -421,18 +466,36 @@ def main() -> None:
         criterion.grid_size = current_img_size // 32
         print(f"epoch={epoch:03d} multi_scale_img_size={current_img_size}", flush=True)
 
-        train_metrics = run_epoch(model, train_loader, criterion, device, optimizer)
-        val_dataset.transform.img_size = args.img_size
-        criterion.img_size = args.img_size
-        criterion.grid_size = args.img_size // 32
-        with torch.no_grad():
-            val_metrics = run_epoch(model, val_loader, criterion, device)
+        train_metrics = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            device,
+            optimizer,
+            scaler=scaler,
+            use_amp=use_amp,
+            channels_last=channels_last,
+        )
         scheduler.step()
 
-        val_loss = val_metrics["loss"]
-        should_eval_map = epoch == start_epoch or epoch == end_epoch or epoch % args.eval_map_every == 0
+        should_eval_map = epoch == end_epoch or epoch % args.eval_map_every == 0
         map_metrics: dict[str, float] | None = None
+        val_metrics: dict[str, float] | None = None
+        val_loss = float("inf")
         if should_eval_map:
+            val_dataset.transform.img_size = args.img_size
+            criterion.img_size = args.img_size
+            criterion.grid_size = args.img_size // 32
+            with torch.no_grad():
+                val_metrics = run_epoch(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    use_amp=use_amp,
+                    channels_last=channels_last,
+                )
+            val_loss = val_metrics["loss"]
             map_metrics = evaluate_map(
                 model=model,
                 dataloader=val_loader,
@@ -442,6 +505,7 @@ def main() -> None:
                 conf_threshold=args.map_conf_threshold,
                 nms_threshold=args.map_nms_threshold,
                 max_detections_per_image=args.map_max_detections_per_image,
+                pre_nms_topk=args.map_pre_nms_topk,
             )
 
             improved = map_metrics["map_50"] > best_map
@@ -467,13 +531,13 @@ def main() -> None:
         message = (
             f"epoch={epoch:03d} "
             f"train_loss={train_metrics['loss']:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} "
             f"best_val_loss={best_val_loss:.4f} "
-            f"val_obj_conf={val_metrics['obj_conf']:.4f} "
-            f"val_noobj_conf={val_metrics['noobj_conf']:.4f}"
         )
         if map_metrics is not None:
             message += (
+                f"val_loss={val_metrics['loss']:.4f} "
+                f"val_obj_conf={val_metrics['obj_conf']:.4f} "
+                f"val_noobj_conf={val_metrics['noobj_conf']:.4f} "
                 f" val_mAP@0.5={map_metrics['map_50']:.4f} "
                 f"best_mAP@0.5={best_map:.4f} "
                 f"val_precision={map_metrics['micro_precision']:.4f} "

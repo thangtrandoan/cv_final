@@ -129,6 +129,16 @@ def main() -> None:
 
     best_val_loss = float("inf")
     best_path = args.checkpoint_dir / "best.pth"
+    print(
+        "Starting training "
+        f"device={device} "
+        f"epochs={args.epochs} "
+        f"batch_size={args.batch_size} "
+        f"train_images={len(train_dataset)} "
+        f"val_images={len(val_dataset)} "
+        f"checkpoint={best_path}",
+        flush=True,
+    )
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(model, train_loader, criterion, device, optimizer)
         with torch.no_grad():

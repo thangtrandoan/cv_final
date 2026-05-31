@@ -94,6 +94,14 @@ def predict_image(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    print(
+        "Starting prediction "
+        f"device={device} "
+        f"image_dir={args.image_dir} "
+        f"checkpoint={args.checkpoint} "
+        f"output={args.output}",
+        flush=True,
+    )
     checkpoint = torch.load(args.checkpoint, map_location=device)
     class_names = checkpoint["class_names"]
     anchors = torch.tensor(checkpoint["anchors"], dtype=torch.float32, device=device)

@@ -9,14 +9,23 @@ from torchvision.models import ResNet50_Weights, resnet50
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         padding = kernel_size // 2
-        self.block = nn.Sequential(
+        layers: list[nn.Module] = [
             nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=False),
             nn.GroupNorm(32, out_channels),
             nn.ReLU(inplace=True),
-        )
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(p=dropout))
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
@@ -26,12 +35,16 @@ class FCOSHead(nn.Module):
     def __init__(self, in_channels: int = 256, num_classes: int = 5) -> None:
         super().__init__()
         self.cls_tower = nn.Sequential(
-            ConvBlock(in_channels, in_channels),
-            ConvBlock(in_channels, in_channels),
+            ConvBlock(in_channels, in_channels, dropout=0.1),
+            ConvBlock(in_channels, in_channels, dropout=0.1),
+            ConvBlock(in_channels, in_channels, dropout=0.1),
+            ConvBlock(in_channels, in_channels, dropout=0.1),
         )
         self.reg_tower = nn.Sequential(
-            ConvBlock(in_channels, in_channels),
-            ConvBlock(in_channels, in_channels),
+            ConvBlock(in_channels, in_channels, dropout=0.1),
+            ConvBlock(in_channels, in_channels, dropout=0.1),
+            ConvBlock(in_channels, in_channels, dropout=0.1),
+            ConvBlock(in_channels, in_channels, dropout=0.1),
         )
         self.cls_head = nn.Conv2d(in_channels, num_classes, kernel_size=3, padding=1)
         self.reg_head = nn.Conv2d(in_channels, 4, kernel_size=3, padding=1)
@@ -78,6 +91,8 @@ class TinyGridDetector(nn.Module):
         self.p5_smooth = ConvBlock(256, 256)
         self.p4_smooth = ConvBlock(256, 256)
         self.p3_smooth = ConvBlock(256, 256)
+        self.p4_out_smooth = ConvBlock(256, 256)
+        self.p5_out_smooth = ConvBlock(256, 256)
         self.head = FCOSHead(256, num_classes)
 
     def forward(self, x: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -87,16 +102,14 @@ class TinyGridDetector(nn.Module):
         c4 = self.layer3(c3)
         c5 = self.layer4(c4)
 
-        p5 = self.p5_conv(c5)
-        p4 = self.p4_conv(c4) + F.interpolate(p5, size=c4.shape[-2:], mode="nearest")
-        p3 = self.p3_conv(c3) + F.interpolate(p4, size=c3.shape[-2:], mode="nearest")
-
-        p5 = self.p5_smooth(p5)
-        p4 = self.p4_smooth(p4)
-        p3 = self.p3_smooth(p3)
+        p5_td = self.p5_conv(c5)
+        p4_td = self.p4_smooth(self.p4_conv(c4) + F.interpolate(p5_td, size=c4.shape[-2:], mode="nearest"))
+        p3_out = self.p3_smooth(self.p3_conv(c3) + F.interpolate(p4_td, size=c3.shape[-2:], mode="nearest"))
+        p4_out = self.p4_out_smooth(p4_td + F.max_pool2d(p3_out, kernel_size=2, stride=2))
+        p5_out = self.p5_out_smooth(p5_td + F.max_pool2d(p4_out, kernel_size=2, stride=2))
 
         return {
-            "p3": self.head(p3),
-            "p4": self.head(p4),
-            "p5": self.head(p5),
+            "p3": self.head(p3_out),
+            "p4": self.head(p4_out),
+            "p5": self.head(p5_out),
         }

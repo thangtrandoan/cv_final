@@ -13,6 +13,8 @@ from utils.nms import nms
 
 
 TTA_BRIGHTNESS_FACTORS = [0.85, 1.15]
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,7 +35,8 @@ def image_to_tensor(image: Image.Image, img_size: int) -> torch.Tensor:
     image = image.convert("RGB").resize((img_size, img_size), Image.BILINEAR)
     data = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
     data = data.view(img_size, img_size, 3)
-    return data.permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+    tensor = data.permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+    return (tensor - IMAGENET_MEAN) / IMAGENET_STD
 
 
 @torch.no_grad()

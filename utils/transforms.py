@@ -7,6 +7,10 @@ import torch
 from PIL import Image, ImageEnhance
 
 
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
+
 class DetectionTransform:
     def __init__(
         self,
@@ -59,4 +63,5 @@ class DetectionTransform:
     def _to_tensor(image: Image.Image) -> torch.Tensor:
         data = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
         data = data.view(image.size[1], image.size[0], 3)
-        return data.permute(2, 0, 1).float().div(255.0)
+        tensor = data.permute(2, 0, 1).float().div(255.0)
+        return (tensor - IMAGENET_MEAN) / IMAGENET_STD

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from models.detector import TinyGridDetector
 from utils.dataset import ObjectDetectionDataset, collate_fn
@@ -15,15 +15,15 @@ from utils.loss import DetectionLoss, LEVEL_SPECS
 from utils.nms import nms
 
 
-MULTI_SCALE_MIN = 320
-MULTI_SCALE_MAX = 640
+MULTI_SCALE_MIN = 384
+MULTI_SCALE_MAX = 512
 EARLY_STOPPING_PATIENCE = 50
 MAP_CONF_THRESHOLD = 0.30
 MAP_NMS_THRESHOLD = 0.45
 MAP_MAX_DETECTIONS_PER_IMAGE = 20
 MAP_PRE_NMS_TOPK = 300
 EVAL_MAP_EVERY = 3
-MODEL_TYPE = "fcos_resnet50_fpn"
+MODEL_TYPE = "fcos_resnet50_bifpn"
 
 
 def format_duration(seconds: float) -> str:
@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_channels_last", action="store_true")
     parser.add_argument("--single_gpu", action="store_true")
+    parser.add_argument("--disable_class_aware_sampler", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume_from_best", action="store_true")
     parser.add_argument("--resume_checkpoint", type=Path)
@@ -108,6 +109,23 @@ def class_weights_from_dataset(dataset: ObjectDetectionDataset) -> torch.Tensor:
             counts[item["class_id"]] += 1
     weights = counts.sum() / (counts * len(counts))
     return weights / weights.mean()
+
+
+def image_sampling_weights(dataset: ObjectDetectionDataset) -> torch.Tensor:
+    counts = torch.ones(len(dataset.class_names), dtype=torch.float32)
+    for targets in dataset.targets_by_image.values():
+        for item in targets:
+            counts[item["class_id"]] += 1
+    class_weights = counts.sum() / (counts * len(counts))
+
+    weights = []
+    for image in dataset.images:
+        targets = dataset.targets_by_image.get(image["id"], [])
+        if not targets:
+            weights.append(0.25)
+            continue
+        weights.append(float(max(class_weights[item["class_id"]] for item in targets)))
+    return torch.tensor(weights, dtype=torch.double)
 
 
 def run_epoch(
@@ -375,10 +393,19 @@ def main() -> None:
     }
     if args.num_workers > 0:
         loader_options["prefetch_factor"] = 2
+    sampler = None
+    if not args.disable_class_aware_sampler:
+        sampler = WeightedRandomSampler(
+            weights=image_sampling_weights(train_dataset),
+            num_samples=len(train_dataset),
+            replacement=True,
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         **loader_options,
     )
     val_loader = DataLoader(
@@ -408,7 +435,15 @@ def main() -> None:
         lambda_noobj=args.lambda_noobj,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.1,
+        patience=5,
+        threshold=0.01,
+        threshold_mode="rel",
+        min_lr=1e-6,
+    )
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     start_epoch = 1
@@ -450,6 +485,7 @@ def main() -> None:
         f"eval_map_every={args.eval_map_every} "
         f"amp={use_amp} "
         f"channels_last={channels_last} "
+        f"class_aware_sampler={sampler is not None} "
         f"map_pre_nms_topk={args.map_pre_nms_topk} "
         f"early_stopping_patience={args.early_stopping_patience} "
         f"train_images={len(train_dataset)} "
@@ -476,8 +512,6 @@ def main() -> None:
             use_amp=use_amp,
             channels_last=channels_last,
         )
-        scheduler.step()
-
         should_eval_map = epoch == end_epoch or epoch % args.eval_map_every == 0
         map_metrics: dict[str, float] | None = None
         val_metrics: dict[str, float] | None = None
@@ -496,6 +530,7 @@ def main() -> None:
                     channels_last=channels_last,
                 )
             val_loss = val_metrics["loss"]
+            scheduler.step(val_loss)
             map_metrics = evaluate_map(
                 model=model,
                 dataloader=val_loader,
@@ -527,6 +562,8 @@ def main() -> None:
                 )
             else:
                 epochs_without_improvement += 1
+        else:
+            current_lr = optimizer.param_groups[0]["lr"]
 
         message = (
             f"epoch={epoch:03d} "
@@ -534,6 +571,7 @@ def main() -> None:
             f"best_val_loss={best_val_loss:.4f} "
         )
         if map_metrics is not None:
+            current_lr = optimizer.param_groups[0]["lr"]
             message += (
                 f"val_loss={val_metrics['loss']:.4f} "
                 f"val_obj_conf={val_metrics['obj_conf']:.4f} "
@@ -543,10 +581,11 @@ def main() -> None:
                 f"val_precision={map_metrics['micro_precision']:.4f} "
                 f"val_recall={map_metrics['micro_recall']:.4f} "
                 f"val_predictions={int(map_metrics['num_predictions'])} "
-                f"patience={epochs_without_improvement}/{args.early_stopping_patience} evals"
+                f"patience={epochs_without_improvement}/{args.early_stopping_patience} evals "
+                f"lr={current_lr:.2e}"
             )
         else:
-            message += f" best_mAP@0.5={best_map:.4f} map_eval=skipped"
+            message += f" best_mAP@0.5={best_map:.4f} map_eval=skipped lr={current_lr:.2e}"
         message += f" epoch_time={format_duration(time.perf_counter() - epoch_start_time)}"
         print(message)
 

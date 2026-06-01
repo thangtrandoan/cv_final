@@ -34,7 +34,7 @@ def centerness_from_ltrb(ltrb: torch.Tensor) -> torch.Tensor:
     return torch.sqrt((lr * tb).clamp(min=0.0, max=1.0))
 
 
-def iou_loss_from_ltrb(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def ciou_loss_from_ltrb(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred_left, pred_top, pred_right, pred_bottom = pred.unbind(dim=-1)
     tgt_left, tgt_top, tgt_right, tgt_bottom = target.unbind(dim=-1)
 
@@ -46,7 +46,38 @@ def iou_loss_from_ltrb(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     target_area = (tgt_left + tgt_right).clamp(min=0.0) * (tgt_top + tgt_bottom).clamp(min=0.0)
     union = pred_area + target_area - inter
     iou = inter / union.clamp(min=1e-6)
-    return -torch.log(iou.clamp(min=1e-6))
+
+    pred_x1 = -pred_left
+    pred_y1 = -pred_top
+    pred_x2 = pred_right
+    pred_y2 = pred_bottom
+    tgt_x1 = -tgt_left
+    tgt_y1 = -tgt_top
+    tgt_x2 = tgt_right
+    tgt_y2 = tgt_bottom
+
+    pred_cx = (pred_x1 + pred_x2) * 0.5
+    pred_cy = (pred_y1 + pred_y2) * 0.5
+    tgt_cx = (tgt_x1 + tgt_x2) * 0.5
+    tgt_cy = (tgt_y1 + tgt_y2) * 0.5
+    center_distance = (pred_cx - tgt_cx).pow(2) + (pred_cy - tgt_cy).pow(2)
+
+    enc_x1 = torch.minimum(pred_x1, tgt_x1)
+    enc_y1 = torch.minimum(pred_y1, tgt_y1)
+    enc_x2 = torch.maximum(pred_x2, tgt_x2)
+    enc_y2 = torch.maximum(pred_y2, tgt_y2)
+    enclosing_diagonal = (enc_x2 - enc_x1).pow(2) + (enc_y2 - enc_y1).pow(2)
+
+    pred_w = (pred_left + pred_right).clamp(min=1e-6)
+    pred_h = (pred_top + pred_bottom).clamp(min=1e-6)
+    tgt_w = (tgt_left + tgt_right).clamp(min=1e-6)
+    tgt_h = (tgt_top + tgt_bottom).clamp(min=1e-6)
+    v = (4.0 / torch.pi**2) * (torch.atan(tgt_w / tgt_h) - torch.atan(pred_w / pred_h)).pow(2)
+    with torch.no_grad():
+        alpha = v / (1.0 - iou + v).clamp(min=1e-6)
+
+    ciou = iou - center_distance / enclosing_diagonal.clamp(min=1e-6) - alpha * v
+    return 1.0 - ciou.clamp(min=-1.0, max=1.0)
 
 
 def encode_fcos_targets(
@@ -180,7 +211,7 @@ class DetectionLoss(nn.Module):
                 pred_ltrb = reg_preds.permute(0, 2, 3, 1)[pos]
                 target_ltrb = reg_target.permute(0, 2, 3, 1)[pos]
                 cnt_weights = cnt_target.squeeze(1)[pos].detach()
-                box_loss = (iou_loss_from_ltrb(pred_ltrb, target_ltrb) * cnt_weights).sum() / cnt_weights.sum().clamp(min=1.0)
+                box_loss = (ciou_loss_from_ltrb(pred_ltrb, target_ltrb) * cnt_weights).sum() / cnt_weights.sum().clamp(min=1.0)
                 cnt_loss = F.binary_cross_entropy_with_logits(cnt_logits.squeeze(1)[pos], cnt_target.squeeze(1)[pos], reduction="mean")
                 pos_cnt_values.append(torch.sigmoid(cnt_logits.squeeze(1)[pos]).detach())
             else:

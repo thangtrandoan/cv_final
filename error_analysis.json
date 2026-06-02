@@ -1,0 +1,398 @@
+{
+  "classes": {
+    "person": {
+      "ap": 0.779108,
+      "gt": 1074,
+      "pred": 7668,
+      "tp": 970,
+      "fp": 6698,
+      "fn": 104,
+      "precision": 0.1265,
+      "recall": 0.903166,
+      "mean_tp_iou": 0.735825,
+      "mean_tp_conf": 0.521403,
+      "mean_fp_conf": 0.145491,
+      "fp_breakdown": {
+        "background": 2712,
+        "duplicate": 182,
+        "wrong_class": 1232,
+        "localization": 2572
+      },
+      "size_gt": {
+        "medium": 374,
+        "large": 463,
+        "small": 237
+      },
+      "size_tp": {
+        "medium": 332,
+        "large": 441,
+        "small": 197
+      },
+      "size_fn": {
+        "large": 22,
+        "medium": 42,
+        "small": 40
+      }
+    },
+    "car": {
+      "ap": 0.702801,
+      "gt": 283,
+      "pred": 5088,
+      "tp": 238,
+      "fp": 4850,
+      "fn": 45,
+      "precision": 0.046777,
+      "recall": 0.840989,
+      "mean_tp_iou": 0.775355,
+      "mean_tp_conf": 0.716749,
+      "mean_fp_conf": 0.136211,
+      "fp_breakdown": {
+        "background": 2748,
+        "duplicate": 23,
+        "wrong_class": 1551,
+        "localization": 528
+      },
+      "size_gt": {
+        "medium": 87,
+        "small": 114,
+        "large": 82
+      },
+      "size_tp": {
+        "medium": 78,
+        "small": 84,
+        "large": 76
+      },
+      "size_fn": {
+        "medium": 9,
+        "small": 30,
+        "large": 6
+      }
+    },
+    "dog": {
+      "ap": 0.724295,
+      "gt": 206,
+      "pred": 824,
+      "tp": 173,
+      "fp": 651,
+      "fn": 33,
+      "precision": 0.209951,
+      "recall": 0.839806,
+      "mean_tp_iou": 0.784394,
+      "mean_tp_conf": 0.714948,
+      "mean_fp_conf": 0.189028,
+      "fp_breakdown": {
+        "background": 271,
+        "duplicate": 17,
+        "wrong_class": 140,
+        "localization": 223
+      },
+      "size_gt": {
+        "large": 140,
+        "medium": 55,
+        "small": 11
+      },
+      "size_tp": {
+        "large": 127,
+        "medium": 42,
+        "small": 4
+      },
+      "size_fn": {
+        "large": 13,
+        "small": 7,
+        "medium": 13
+      }
+    },
+    "cat": {
+      "ap": 0.842779,
+      "gt": 176,
+      "pred": 1953,
+      "tp": 170,
+      "fp": 1783,
+      "fn": 6,
+      "precision": 0.087046,
+      "recall": 0.965909,
+      "mean_tp_iou": 0.779888,
+      "mean_tp_conf": 0.778252,
+      "mean_fp_conf": 0.15253,
+      "fp_breakdown": {
+        "background": 469,
+        "duplicate": 41,
+        "wrong_class": 630,
+        "localization": 643
+      },
+      "size_gt": {
+        "large": 147,
+        "small": 6,
+        "medium": 23
+      },
+      "size_tp": {
+        "large": 146,
+        "small": 5,
+        "medium": 19
+      },
+      "size_fn": {
+        "medium": 4,
+        "large": 1,
+        "small": 1
+      }
+    },
+    "chair": {
+      "ap": 0.475911,
+      "gt": 282,
+      "pred": 4467,
+      "tp": 221,
+      "fp": 4246,
+      "fn": 61,
+      "precision": 0.049474,
+      "recall": 0.783688,
+      "mean_tp_iou": 0.729927,
+      "mean_tp_conf": 0.607894,
+      "mean_fp_conf": 0.19154,
+      "fp_breakdown": {
+        "background": 1759,
+        "duplicate": 40,
+        "wrong_class": 1693,
+        "localization": 754
+      },
+      "size_gt": {
+        "medium": 166,
+        "small": 33,
+        "large": 83
+      },
+      "size_tp": {
+        "medium": 137,
+        "large": 70,
+        "small": 14
+      },
+      "size_fn": {
+        "medium": 29,
+        "small": 19,
+        "large": 13
+      }
+    }
+  },
+  "confusion_top": [
+    {
+      "gt": "person",
+      "pred": "chair",
+      "count": 1124
+    },
+    {
+      "gt": "person",
+      "pred": "car",
+      "count": 860
+    },
+    {
+      "gt": "dog",
+      "pred": "person",
+      "count": 553
+    },
+    {
+      "gt": "dog",
+      "pred": "cat",
+      "count": 445
+    },
+    {
+      "gt": "dog",
+      "pred": "car",
+      "count": 353
+    },
+    {
+      "gt": "car",
+      "pred": "person",
+      "count": 282
+    },
+    {
+      "gt": "cat",
+      "pred": "chair",
+      "count": 261
+    },
+    {
+      "gt": "dog",
+      "pred": "chair",
+      "count": 255
+    },
+    {
+      "gt": "cat",
+      "pred": "person",
+      "count": 254
+    },
+    {
+      "gt": "cat",
+      "pred": "car",
+      "count": 248
+    },
+    {
+      "gt": "chair",
+      "pred": "person",
+      "count": 143
+    },
+    {
+      "gt": "person",
+      "pred": "cat",
+      "count": 130
+    },
+    {
+      "gt": "chair",
+      "pred": "car",
+      "count": 90
+    },
+    {
+      "gt": "person",
+      "pred": "dog",
+      "count": 74
+    },
+    {
+      "gt": "car",
+      "pred": "chair",
+      "count": 53
+    },
+    {
+      "gt": "cat",
+      "pred": "dog",
+      "count": 50
+    },
+    {
+      "gt": "chair",
+      "pred": "cat",
+      "count": 37
+    },
+    {
+      "gt": "car",
+      "pred": "cat",
+      "count": 18
+    },
+    {
+      "gt": "chair",
+      "pred": "dog",
+      "count": 9
+    },
+    {
+      "gt": "car",
+      "pred": "dog",
+      "count": 7
+    }
+  ],
+  "worst_images": [
+    {
+      "image_id": "img_66bc8a30fa85.jpg",
+      "errors": 23
+    },
+    {
+      "image_id": "img_c9ba3fb5c863.jpg",
+      "errors": 23
+    },
+    {
+      "image_id": "img_01073356e41c.jpg",
+      "errors": 22
+    },
+    {
+      "image_id": "img_269749b06860.jpg",
+      "errors": 22
+    },
+    {
+      "image_id": "img_3c5e20122f8e.jpg",
+      "errors": 22
+    },
+    {
+      "image_id": "img_4229b9c15085.jpg",
+      "errors": 22
+    },
+    {
+      "image_id": "img_f4ea9342d176.jpg",
+      "errors": 22
+    },
+    {
+      "image_id": "img_00090df9158f.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_0157c7e7f027.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_066da6caba6b.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_09c5c06162a3.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_230a94f3c914.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_23869736393f.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_28e2e84fbd07.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_2daa376e77fd.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_2f64659a6324.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_336da23b5a9d.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_362a4acd4de8.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_3c26c2325fb6.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_3e956844ceed.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_4174fb563f9d.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_47d7b2b05ab9.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_4ae5109c05aa.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_4f10a2144ebe.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_51e582e7dc22.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_57b3b5ef0f74.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_5b35abeb2218.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_624fe631b2b2.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_63690c5761fe.jpg",
+      "errors": 21
+    },
+    {
+      "image_id": "img_68732cf25d8a.jpg",
+      "errors": 21
+    }
+  ]
+}

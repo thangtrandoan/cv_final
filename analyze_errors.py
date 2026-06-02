@@ -103,7 +103,8 @@ def analyze(ground_truth: dict[str, Any], predictions: list[dict[str, Any]], iou
     worst_images = Counter()
     all_class_predictions: dict[str, list[dict[str, Any]]] = {class_name: [] for class_name in classes}
 
-    for image_id, gts in gt_by_image.items():
+    for image_id in image_info:
+        gts = gt_by_image.get(image_id, [])
         for gt in gts:
             per_class[gt["class"]]["gt"] += 1
             per_class[gt["class"]]["size_gt"][gt["size"]] += 1

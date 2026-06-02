@@ -18,7 +18,7 @@ from utils.nms import nms
 MULTI_SCALE_MIN = 384
 MULTI_SCALE_MAX = 512
 EARLY_STOPPING_PATIENCE = 50
-MAP_CONF_THRESHOLD = 0.30
+MAP_CONF_THRESHOLD = 0.05
 MAP_NMS_THRESHOLD = 0.45
 MAP_MAX_DETECTIONS_PER_IMAGE = 20
 MAP_PRE_NMS_TOPK = 300
@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lambda_noobj", type=float, default=2.0)
+    parser.add_argument("--chair_loss_boost", type=float, default=2.0)
     parser.add_argument("--multi_scale_min", type=int, default=MULTI_SCALE_MIN)
     parser.add_argument("--multi_scale_max", type=int, default=MULTI_SCALE_MAX)
     parser.add_argument("--early_stopping_patience", type=int, default=EARLY_STOPPING_PATIENCE)
@@ -102,12 +103,14 @@ def bbox_iou(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-def class_weights_from_dataset(dataset: ObjectDetectionDataset) -> torch.Tensor:
+def class_weights_from_dataset(dataset: ObjectDetectionDataset, chair_loss_boost: float = 1.0) -> torch.Tensor:
     counts = torch.ones(len(dataset.class_names), dtype=torch.float32)
     for targets in dataset.targets_by_image.values():
         for item in targets:
             counts[item["class_id"]] += 1
     weights = counts.sum() / (counts * len(counts))
+    if "chair" in dataset.class_to_idx:
+        weights[dataset.class_to_idx["chair"]] *= chair_loss_boost
     return weights / weights.mean()
 
 
@@ -426,7 +429,7 @@ def main() -> None:
         model.load_state_dict(checkpoint["model_state_dict"])
     if gpu_count > 1 and not args.single_gpu:
         model = torch.nn.DataParallel(model)
-    class_weights = class_weights_from_dataset(train_dataset).to(device)
+    class_weights = class_weights_from_dataset(train_dataset, args.chair_loss_boost).to(device)
     criterion = DetectionLoss(
         img_size=args.img_size,
         grid_size=args.img_size // 32,
@@ -486,6 +489,7 @@ def main() -> None:
         f"amp={use_amp} "
         f"channels_last={channels_last} "
         f"class_aware_sampler={sampler is not None} "
+        f"chair_loss_boost={args.chair_loss_boost} "
         f"map_pre_nms_topk={args.map_pre_nms_topk} "
         f"early_stopping_patience={args.early_stopping_patience} "
         f"train_images={len(train_dataset)} "

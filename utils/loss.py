@@ -19,12 +19,17 @@ def focal_loss(
     targets: torch.Tensor,
     alpha: float = 0.25,
     gamma: float = 2.0,
+    class_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     probs = torch.sigmoid(logits)
     p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
     alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
-    return alpha_t * (1.0 - p_t).pow(gamma) * bce
+    loss = alpha_t * (1.0 - p_t).pow(gamma) * bce
+    if class_weights is not None:
+        positive_weights = class_weights.view(1, -1, 1, 1).to(logits.device)
+        loss = loss * (1.0 + targets * (positive_weights - 1.0))
+    return loss
 
 
 def centerness_from_ltrb(ltrb: torch.Tensor) -> torch.Tensor:
@@ -177,6 +182,9 @@ class DetectionLoss(nn.Module):
         self.lambda_box = lambda_box
         self.lambda_obj = lambda_obj
         self.lambda_cls = lambda_cls
+        if class_weights is None:
+            class_weights = torch.ones(num_classes, dtype=torch.float32)
+        self.register_buffer("class_weights", class_weights.float())
 
     def forward(
         self,
@@ -203,7 +211,7 @@ class DetectionLoss(nn.Module):
             total_pos += num_pos
             total_locations += pos_mask.numel()
 
-            cls_loss = focal_loss(cls_logits, cls_target).sum() / max(num_pos, 1)
+            cls_loss = focal_loss(cls_logits, cls_target, class_weights=self.class_weights).sum() / max(num_pos, 1)
             total_cls_loss = total_cls_loss + cls_loss
 
             if num_pos:

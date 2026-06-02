@@ -1,0 +1,156 @@
+{
+  "classes": {
+    "person": {
+      "ap": 1.0,
+      "gt": 1074,
+      "pred": 1074,
+      "tp": 1074,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "mean_tp_iou": 1.0,
+      "mean_tp_conf": 1.0,
+      "mean_fp_conf": 0.0,
+      "fp_breakdown": {
+        "background": 0,
+        "duplicate": 0,
+        "wrong_class": 0,
+        "localization": 0
+      },
+      "size_gt": {
+        "medium": 374,
+        "large": 463,
+        "small": 237
+      },
+      "size_tp": {
+        "medium": 374,
+        "large": 463,
+        "small": 237
+      },
+      "size_fn": {}
+    },
+    "car": {
+      "ap": 1.0,
+      "gt": 283,
+      "pred": 283,
+      "tp": 283,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "mean_tp_iou": 1.0,
+      "mean_tp_conf": 1.0,
+      "mean_fp_conf": 0.0,
+      "fp_breakdown": {
+        "background": 0,
+        "duplicate": 0,
+        "wrong_class": 0,
+        "localization": 0
+      },
+      "size_gt": {
+        "medium": 87,
+        "small": 114,
+        "large": 82
+      },
+      "size_tp": {
+        "medium": 87,
+        "small": 114,
+        "large": 82
+      },
+      "size_fn": {}
+    },
+    "dog": {
+      "ap": 1.0,
+      "gt": 206,
+      "pred": 206,
+      "tp": 206,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "mean_tp_iou": 1.0,
+      "mean_tp_conf": 1.0,
+      "mean_fp_conf": 0.0,
+      "fp_breakdown": {
+        "background": 0,
+        "duplicate": 0,
+        "wrong_class": 0,
+        "localization": 0
+      },
+      "size_gt": {
+        "large": 140,
+        "medium": 55,
+        "small": 11
+      },
+      "size_tp": {
+        "large": 140,
+        "medium": 55,
+        "small": 11
+      },
+      "size_fn": {}
+    },
+    "cat": {
+      "ap": 1.0,
+      "gt": 176,
+      "pred": 176,
+      "tp": 176,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "mean_tp_iou": 1.0,
+      "mean_tp_conf": 1.0,
+      "mean_fp_conf": 0.0,
+      "fp_breakdown": {
+        "background": 0,
+        "duplicate": 0,
+        "wrong_class": 0,
+        "localization": 0
+      },
+      "size_gt": {
+        "large": 147,
+        "small": 6,
+        "medium": 23
+      },
+      "size_tp": {
+        "large": 147,
+        "small": 6,
+        "medium": 23
+      },
+      "size_fn": {}
+    },
+    "chair": {
+      "ap": 1.0,
+      "gt": 282,
+      "pred": 282,
+      "tp": 282,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "mean_tp_iou": 1.0,
+      "mean_tp_conf": 1.0,
+      "mean_fp_conf": 0.0,
+      "fp_breakdown": {
+        "background": 0,
+        "duplicate": 0,
+        "wrong_class": 0,
+        "localization": 0
+      },
+      "size_gt": {
+        "medium": 166,
+        "small": 33,
+        "large": 83
+      },
+      "size_tp": {
+        "medium": 166,
+        "small": 33,
+        "large": 83
+      },
+      "size_fn": {}
+    }
+  },
+  "confusion_top": [],
+  "worst_images": []
+}

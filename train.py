@@ -24,6 +24,7 @@ MAP_MAX_DETECTIONS_PER_IMAGE = 20
 MAP_PRE_NMS_TOPK = 300
 EVAL_MAP_EVERY = 3
 MODEL_TYPE = "fcos_resnet50_bifpn"
+PREPROCESS_MODE = "letterbox"
 
 
 def format_duration(seconds: float) -> str:
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lambda_noobj", type=float, default=2.0)
-    parser.add_argument("--chair_loss_boost", type=float, default=2.0)
+    parser.add_argument("--chair_loss_boost", type=float, default=1.5)
     parser.add_argument("--multi_scale_min", type=int, default=MULTI_SCALE_MIN)
     parser.add_argument("--multi_scale_max", type=int, default=MULTI_SCALE_MAX)
     parser.add_argument("--early_stopping_patience", type=int, default=EARLY_STOPPING_PATIENCE)
@@ -119,13 +120,13 @@ def image_sampling_weights(dataset: ObjectDetectionDataset) -> torch.Tensor:
     for targets in dataset.targets_by_image.values():
         for item in targets:
             counts[item["class_id"]] += 1
-    class_weights = counts.sum() / (counts * len(counts))
+    class_weights = torch.sqrt(counts.sum() / (counts * len(counts)))
 
     weights = []
     for image in dataset.images:
         targets = dataset.targets_by_image.get(image["id"], [])
         if not targets:
-            weights.append(0.25)
+            weights.append(0.75)
             continue
         weights.append(float(max(class_weights[item["class_id"]] for item in targets)))
     return torch.tensor(weights, dtype=torch.double)
@@ -353,6 +354,7 @@ def save_checkpoint(
             "best_val_loss": best_val_loss,
             "best_metric": best_metric,
             "model_type": MODEL_TYPE,
+            "preprocess": PREPROCESS_MODE,
         },
         path,
     )
@@ -384,6 +386,15 @@ def main() -> None:
                 "Resume checkpoint is not compatible with the current model. "
                 f"checkpoint_model_type={checkpoint_model_type!r}, current_model_type={MODEL_TYPE!r}. "
                 "Train from scratch or resume from a checkpoint created by the current FCOS model."
+            )
+        checkpoint_preprocess = checkpoint.get("preprocess", "stretch")
+        if checkpoint_preprocess != PREPROCESS_MODE:
+            print(
+                "Warning: resume checkpoint uses different preprocessing "
+                f"checkpoint_preprocess={checkpoint_preprocess!r} "
+                f"current_preprocess={PREPROCESS_MODE!r}. "
+                "Weights are compatible, but a fresh run is usually cleaner.",
+                flush=True,
             )
 
     train_dataset = ObjectDetectionDataset(args.train_data, args.image_dir, img_size=args.img_size, train=True)
@@ -482,6 +493,7 @@ def main() -> None:
         f"gpus={gpu_count} "
         f"single_gpu={args.single_gpu} "
         f"architecture={MODEL_TYPE} "
+        f"preprocess={PREPROCESS_MODE} "
         f"pretrained_backbone=True "
         f"multi_scale=True "
         f"eval_map=True "

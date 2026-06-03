@@ -9,6 +9,7 @@ from PIL import Image, ImageEnhance
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+LETTERBOX_FILL = tuple(int(round(value * 255)) for value in (0.485, 0.456, 0.406))
 
 
 class DetectionTransform:
@@ -38,20 +39,30 @@ class DetectionTransform:
         if self.train and self.color_jitter > 0:
             image = self._color_jitter(image)
 
-        image = image.resize((self.img_size, self.img_size), Image.BILINEAR)
-        scale_x = self.img_size / width
-        scale_y = self.img_size / height
+        image, scale, pad_x, pad_y = self._letterbox(image)
         for item in targets:
             xmin, ymin, xmax, ymax = item["bbox"]
             item["bbox"] = [
-                max(0.0, min(self.img_size, xmin * scale_x)),
-                max(0.0, min(self.img_size, ymin * scale_y)),
-                max(0.0, min(self.img_size, xmax * scale_x)),
-                max(0.0, min(self.img_size, ymax * scale_y)),
+                max(0.0, min(self.img_size, xmin * scale + pad_x)),
+                max(0.0, min(self.img_size, ymin * scale + pad_y)),
+                max(0.0, min(self.img_size, xmax * scale + pad_x)),
+                max(0.0, min(self.img_size, ymax * scale + pad_y)),
             ]
 
         tensor = self._to_tensor(image)
         return tensor, targets
+
+    def _letterbox(self, image: Image.Image) -> tuple[Image.Image, float, int, int]:
+        width, height = image.size
+        scale = min(self.img_size / width, self.img_size / height)
+        resized_w = max(1, int(round(width * scale)))
+        resized_h = max(1, int(round(height * scale)))
+        resized = image.resize((resized_w, resized_h), Image.BILINEAR)
+        canvas = Image.new("RGB", (self.img_size, self.img_size), LETTERBOX_FILL)
+        pad_x = (self.img_size - resized_w) // 2
+        pad_y = (self.img_size - resized_h) // 2
+        canvas.paste(resized, (pad_x, pad_y))
+        return canvas, scale, pad_x, pad_y
 
     def _color_jitter(self, image: Image.Image) -> Image.Image:
         for enhancer_cls in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):

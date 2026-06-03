@@ -15,6 +15,7 @@ from utils.nms import nms
 TTA_BRIGHTNESS_FACTORS = [0.85, 1.15]
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+LETTERBOX_FILL = tuple(int(round(value * 255)) for value in (0.485, 0.456, 0.406))
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,17 +27,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf_threshold", type=float, default=0.45)
     parser.add_argument("--nms_threshold", type=float, default=0.45)
     parser.add_argument("--max_detections_per_image", type=int, default=20)
+    parser.add_argument("--preprocess", choices=("auto", "letterbox", "stretch"), default="auto")
     parser.add_argument("--tta_brightness", nargs="*", type=float, default=TTA_BRIGHTNESS_FACTORS)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
 
-def image_to_tensor(image: Image.Image, img_size: int) -> torch.Tensor:
-    image = image.convert("RGB").resize((img_size, img_size), Image.BILINEAR)
+def letterbox_image(image: Image.Image, img_size: int) -> tuple[Image.Image, float, int, int]:
+    image = image.convert("RGB")
+    width, height = image.size
+    scale = min(img_size / width, img_size / height)
+    resized_w = max(1, int(round(width * scale)))
+    resized_h = max(1, int(round(height * scale)))
+    resized = image.resize((resized_w, resized_h), Image.BILINEAR)
+    canvas = Image.new("RGB", (img_size, img_size), LETTERBOX_FILL)
+    pad_x = (img_size - resized_w) // 2
+    pad_y = (img_size - resized_h) // 2
+    canvas.paste(resized, (pad_x, pad_y))
+    return canvas, scale, pad_x, pad_y
+
+
+def image_to_tensor(image: Image.Image, img_size: int, preprocess: str) -> tuple[torch.Tensor, float, int, int]:
+    if preprocess == "letterbox":
+        image, scale, pad_x, pad_y = letterbox_image(image, img_size)
+    else:
+        original_w, original_h = image.size
+        image = image.convert("RGB").resize((img_size, img_size), Image.BILINEAR)
+        scale = img_size / max(original_w, 1)
+        pad_x = 0
+        pad_y = 0
     data = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
     data = data.view(img_size, img_size, 3)
     tensor = data.permute(2, 0, 1).float().div(255.0).unsqueeze(0)
-    return (tensor - IMAGENET_MEAN) / IMAGENET_STD
+    return (tensor - IMAGENET_MEAN) / IMAGENET_STD, scale, pad_x, pad_y
 
 
 @torch.no_grad()
@@ -49,9 +72,11 @@ def predict_image(
     conf_threshold: float,
     nms_threshold: float,
     device: torch.device,
+    preprocess: str,
 ) -> dict[str, object]:
     original_w, original_h = image.size
-    tensor = image_to_tensor(image, img_size).to(device)
+    tensor, scale, pad_x, pad_y = image_to_tensor(image, img_size, preprocess)
+    tensor = tensor.to(device)
     outputs = model(tensor)
 
     output_boxes: list[dict[str, object]] = []
@@ -80,12 +105,17 @@ def predict_image(
             ),
             dim=1,
         )
-        scale = torch.tensor(
-            [original_w / img_size, original_h / img_size, original_w / img_size, original_h / img_size],
-            device=device,
-            dtype=torch.float32,
-        )
-        boxes = (boxes * scale).clamp(min=0)
+        if preprocess == "letterbox":
+            boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
+            boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
+        else:
+            resize_scale = torch.tensor(
+                [original_w / img_size, original_h / img_size, original_w / img_size, original_h / img_size],
+                device=device,
+                dtype=torch.float32,
+            )
+            boxes = boxes * resize_scale
+        boxes = boxes.clamp(min=0)
         boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(max=original_w)
         boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(max=original_h)
 
@@ -149,6 +179,7 @@ def predict_with_tta(
     max_detections_per_image: int,
     brightness_factors: list[float],
     device: torch.device,
+    preprocess: str,
 ) -> dict[str, object]:
     image = Image.open(image_path).convert("RGB")
     original_w, _ = image.size
@@ -169,6 +200,7 @@ def predict_with_tta(
             conf_threshold,
             nms_threshold,
             device,
+            preprocess,
         )
         for box in prediction["boxes"]:
             box = dict(box)
@@ -190,11 +222,18 @@ def predict_with_tta(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    class_names = checkpoint["class_names"]
+    img_size = int(checkpoint.get("img_size", args.img_size))
+    preprocess = args.preprocess
+    if preprocess == "auto":
+        preprocess = str(checkpoint.get("preprocess", "stretch"))
     print(
         "Starting prediction "
         f"device={device} "
         f"image_dir={args.image_dir} "
         f"checkpoint={args.checkpoint} "
+        f"preprocess={preprocess} "
         f"conf_threshold={args.conf_threshold} "
         f"max_detections_per_image={args.max_detections_per_image} "
         f"tta=True "
@@ -202,9 +241,6 @@ def main() -> None:
         f"output={args.output}",
         flush=True,
     )
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    class_names = checkpoint["class_names"]
-    img_size = int(checkpoint.get("img_size", args.img_size))
 
     model = TinyGridDetector(
         num_classes=len(class_names),
@@ -231,6 +267,7 @@ def main() -> None:
             args.max_detections_per_image,
             args.tta_brightness,
             device,
+            preprocess,
         )
         for image_path in image_paths
     ]

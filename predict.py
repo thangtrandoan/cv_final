@@ -27,8 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf_threshold", type=float, default=0.45)
     parser.add_argument("--nms_threshold", type=float, default=0.45)
     parser.add_argument("--max_detections_per_image", type=int, default=20)
+    parser.add_argument("--pre_nms_topk", type=int, default=1000)
     parser.add_argument("--preprocess", choices=("auto", "letterbox", "stretch"), default="auto")
+    parser.add_argument("--disable_tta", action="store_true")
     parser.add_argument("--tta_brightness", nargs="*", type=float, default=TTA_BRIGHTNESS_FACTORS)
+    parser.add_argument("--progress_every", type=int, default=100)
+    parser.add_argument("--no_channels_last", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -71,12 +75,16 @@ def predict_image(
     img_size: int,
     conf_threshold: float,
     nms_threshold: float,
+    pre_nms_topk: int,
     device: torch.device,
     preprocess: str,
+    channels_last: bool,
 ) -> dict[str, object]:
     original_w, original_h = image.size
     tensor, scale, pad_x, pad_y = image_to_tensor(image, img_size, preprocess)
     tensor = tensor.to(device)
+    if channels_last:
+        tensor = tensor.contiguous(memory_format=torch.channels_last)
     outputs = model(tensor)
 
     output_boxes: list[dict[str, object]] = []
@@ -122,6 +130,10 @@ def predict_image(
         boxes = boxes[keep]
         scores = scores[keep]
         class_ids = class_ids[keep]
+        if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
+            scores, topk_indices = scores.topk(pre_nms_topk)
+            boxes = boxes[topk_indices]
+            class_ids = class_ids[topk_indices]
         for class_id in class_ids.unique():
             class_mask = class_ids == class_id
             selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
@@ -177,18 +189,22 @@ def predict_with_tta(
     conf_threshold: float,
     nms_threshold: float,
     max_detections_per_image: int,
+    pre_nms_topk: int,
     brightness_factors: list[float],
     device: torch.device,
     preprocess: str,
+    use_tta: bool,
+    channels_last: bool,
 ) -> dict[str, object]:
     image = Image.open(image_path).convert("RGB")
     original_w, _ = image.size
     all_boxes: list[dict[str, object]] = []
 
     variants: list[tuple[Image.Image, bool]] = [(image, False)]
-    variants.append((image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), True))
-    for factor in brightness_factors:
-        variants.append((ImageEnhance.Brightness(image).enhance(factor), False))
+    if use_tta:
+        variants.append((image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), True))
+        for factor in brightness_factors:
+            variants.append((ImageEnhance.Brightness(image).enhance(factor), False))
 
     for variant, flipped in variants:
         prediction = predict_image(
@@ -199,8 +215,10 @@ def predict_with_tta(
             img_size,
             conf_threshold,
             nms_threshold,
+            pre_nms_topk,
             device,
             preprocess,
+            channels_last,
         )
         for box in prediction["boxes"]:
             box = dict(box)
@@ -222,12 +240,18 @@ def predict_with_tta(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     checkpoint = torch.load(args.checkpoint, map_location=device)
     class_names = checkpoint["class_names"]
     img_size = int(checkpoint.get("img_size", args.img_size))
     preprocess = args.preprocess
     if preprocess == "auto":
         preprocess = str(checkpoint.get("preprocess", "stretch"))
+    use_tta = not args.disable_tta
+    channels_last = device.type == "cuda" and not args.no_channels_last
     print(
         "Starting prediction "
         f"device={device} "
@@ -236,8 +260,10 @@ def main() -> None:
         f"preprocess={preprocess} "
         f"conf_threshold={args.conf_threshold} "
         f"max_detections_per_image={args.max_detections_per_image} "
-        f"tta=True "
+        f"pre_nms_topk={args.pre_nms_topk} "
+        f"tta={use_tta} "
         f"tta_brightness={args.tta_brightness} "
+        f"channels_last={channels_last} "
         f"output={args.output}",
         flush=True,
     )
@@ -246,6 +272,8 @@ def main() -> None:
         num_classes=len(class_names),
         pretrained_backbone=False,
     ).to(device)
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -256,21 +284,27 @@ def main() -> None:
             if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
         ]
     )
-    predictions = [
-        predict_with_tta(
-            model,
-            image_path,
-            class_names,
-            img_size,
-            args.conf_threshold,
-            args.nms_threshold,
-            args.max_detections_per_image,
-            args.tta_brightness,
-            device,
-            preprocess,
+    predictions = []
+    for index, image_path in enumerate(image_paths, start=1):
+        predictions.append(
+            predict_with_tta(
+                model,
+                image_path,
+                class_names,
+                img_size,
+                args.conf_threshold,
+                args.nms_threshold,
+                args.max_detections_per_image,
+                args.pre_nms_topk,
+                args.tta_brightness,
+                device,
+                preprocess,
+                use_tta,
+                channels_last,
+            )
         )
-        for image_path in image_paths
-    ]
+        if args.progress_every > 0 and (index == len(image_paths) or index % args.progress_every == 0):
+            print(f"predicted={index}/{len(image_paths)}", flush=True)
     write_json(predictions, args.output)
     print(f"Wrote {len(predictions)} predictions to {args.output}")
 

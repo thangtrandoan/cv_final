@@ -66,6 +66,25 @@ def image_to_tensor(image: Image.Image, img_size: int, preprocess: str) -> tuple
     return (tensor - IMAGENET_MEAN) / IMAGENET_STD, scale, pad_x, pad_y
 
 
+def rounded_valid_bbox(box: list[float], max_width: int | None = None, max_height: int | None = None) -> list[float] | None:
+    xmin, ymin, xmax, ymax = box
+    xmin = max(0.0, xmin)
+    ymin = max(0.0, ymin)
+    xmax = max(0.0, xmax)
+    ymax = max(0.0, ymax)
+    if max_width is not None:
+        xmin = min(float(max_width), xmin)
+        xmax = min(float(max_width), xmax)
+    if max_height is not None:
+        ymin = min(float(max_height), ymin)
+        ymax = min(float(max_height), ymax)
+
+    rounded = [round(xmin, 2), round(ymin, 2), round(xmax, 2), round(ymax, 2)]
+    if rounded[2] <= rounded[0] or rounded[3] <= rounded[1]:
+        return None
+    return rounded
+
+
 @torch.no_grad()
 def predict_image(
     model: TinyGridDetector,
@@ -141,13 +160,14 @@ def predict_image(
             class_scores_selected = scores[class_mask][selected]
             for box, score in zip(class_boxes, class_scores_selected):
                 xmin, ymin, xmax, ymax = box.tolist()
-                if xmax <= xmin or ymax <= ymin:
+                bbox = rounded_valid_bbox([xmin, ymin, xmax, ymax], original_w, original_h)
+                if bbox is None:
                     continue
                 output_boxes.append(
                     {
                         "class": class_names[int(class_id.item())],
                         "confidence": round(float(score.item()), 6),
-                        "bbox": [round(xmin, 2), round(ymin, 2), round(xmax, 2), round(ymax, 2)],
+                        "bbox": bbox,
                     }
                 )
 
@@ -168,7 +188,11 @@ def merge_boxes(
 
     merged: list[dict[str, object]] = []
     for class_name in class_names:
-        class_boxes = [box for box in boxes if box["class"] == class_name]
+        class_boxes = [
+            box
+            for box in boxes
+            if box["class"] == class_name and rounded_valid_bbox([float(value) for value in box["bbox"]]) is not None
+        ]
         if not class_boxes:
             continue
         box_tensor = torch.tensor([box["bbox"] for box in class_boxes], dtype=torch.float32, device=device)
@@ -197,7 +221,7 @@ def predict_with_tta(
     channels_last: bool,
 ) -> dict[str, object]:
     image = Image.open(image_path).convert("RGB")
-    original_w, _ = image.size
+    original_w, original_h = image.size
     all_boxes: list[dict[str, object]] = []
 
     variants: list[tuple[Image.Image, bool]] = [(image, False)]
@@ -224,7 +248,10 @@ def predict_with_tta(
             box = dict(box)
             if flipped:
                 xmin, ymin, xmax, ymax = box["bbox"]
-                box["bbox"] = [round(original_w - xmax, 2), ymin, round(original_w - xmin, 2), ymax]
+                bbox = rounded_valid_bbox([original_w - xmax, ymin, original_w - xmin, ymax], original_w, original_h)
+                if bbox is None:
+                    continue
+                box["bbox"] = bbox
             all_boxes.append(box)
 
     return merge_boxes(

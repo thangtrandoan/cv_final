@@ -71,11 +71,18 @@ class FCOSHead(nn.Module):
 
 
 class TinyGridDetector(nn.Module):
-    level_strides = {"p3": 8, "p4": 16, "p5": 32}
+    level_strides = {"p2": 4, "p3": 8, "p4": 16, "p5": 32}
 
-    def __init__(self, num_classes: int = 5, num_anchors: int = 3, pretrained_backbone: bool = True) -> None:
+    def __init__(
+        self,
+        num_classes: int = 5,
+        num_anchors: int = 3,
+        pretrained_backbone: bool = True,
+        use_p2: bool = False,
+    ) -> None:
         super().__init__()
         self.num_classes = num_classes
+        self.use_p2 = use_p2
         weights = ResNet50_Weights.DEFAULT if pretrained_backbone else None
         backbone = resnet50(weights=weights)
 
@@ -88,6 +95,10 @@ class TinyGridDetector(nn.Module):
         self.p5_conv = nn.Conv2d(2048, 256, kernel_size=1)
         self.p4_conv = nn.Conv2d(1024, 256, kernel_size=1)
         self.p3_conv = nn.Conv2d(512, 256, kernel_size=1)
+        if self.use_p2:
+            self.p2_conv = nn.Conv2d(256, 256, kernel_size=1)
+            self.p2_smooth = ConvBlock(256, 256)
+            self.p3_out_smooth = ConvBlock(256, 256)
         self.p5_smooth = ConvBlock(256, 256)
         self.p4_smooth = ConvBlock(256, 256)
         self.p3_smooth = ConvBlock(256, 256)
@@ -104,12 +115,21 @@ class TinyGridDetector(nn.Module):
 
         p5_td = self.p5_conv(c5)
         p4_td = self.p4_smooth(self.p4_conv(c4) + F.interpolate(p5_td, size=c4.shape[-2:], mode="nearest"))
-        p3_out = self.p3_smooth(self.p3_conv(c3) + F.interpolate(p4_td, size=c3.shape[-2:], mode="nearest"))
+        p3_td = self.p3_smooth(self.p3_conv(c3) + F.interpolate(p4_td, size=c3.shape[-2:], mode="nearest"))
+        if self.use_p2:
+            p2_out = self.p2_smooth(self.p2_conv(c2) + F.interpolate(p3_td, size=c2.shape[-2:], mode="nearest"))
+            p3_out = self.p3_out_smooth(p3_td + F.max_pool2d(p2_out, kernel_size=2, stride=2))
+        else:
+            p2_out = None
+            p3_out = p3_td
         p4_out = self.p4_out_smooth(p4_td + F.max_pool2d(p3_out, kernel_size=2, stride=2))
         p5_out = self.p5_out_smooth(p5_td + F.max_pool2d(p4_out, kernel_size=2, stride=2))
 
-        return {
+        outputs = {
             "p3": self.head(p3_out),
             "p4": self.head(p4_out),
             "p5": self.head(p5_out),
         }
+        if p2_out is not None:
+            outputs = {"p2": self.head(p2_out), **outputs}
+        return outputs

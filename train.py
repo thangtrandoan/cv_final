@@ -23,7 +23,8 @@ MAP_NMS_THRESHOLD = 0.45
 MAP_MAX_DETECTIONS_PER_IMAGE = 20
 MAP_PRE_NMS_TOPK = 300
 EVAL_MAP_EVERY = 3
-MODEL_TYPE = "fcos_resnet50_bifpn"
+MODEL_TYPE_BASE = "fcos_resnet50_bifpn"
+MODEL_TYPE_P2 = "fcos_resnet50_bifpn_p2"
 PREPROCESS_MODE = "letterbox"
 
 
@@ -68,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_channels_last", action="store_true")
     parser.add_argument("--single_gpu", action="store_true")
     parser.add_argument("--disable_class_aware_sampler", action="store_true")
+    parser.add_argument("--disable_p2", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume_from_best", action="store_true")
     parser.add_argument("--resume_checkpoint", type=Path)
@@ -339,6 +341,8 @@ def save_checkpoint(
     epoch: int,
     best_val_loss: float,
     best_metric: float,
+    model_type: str,
+    use_p2: bool,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
@@ -353,8 +357,9 @@ def save_checkpoint(
             "epoch": epoch,
             "best_val_loss": best_val_loss,
             "best_metric": best_metric,
-            "model_type": MODEL_TYPE,
+            "model_type": model_type,
             "preprocess": PREPROCESS_MODE,
+            "use_p2": use_p2,
         },
         path,
     )
@@ -363,6 +368,8 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    use_p2 = not args.disable_p2
+    model_type = MODEL_TYPE_P2 if use_p2 else MODEL_TYPE_BASE
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -381,10 +388,10 @@ def main() -> None:
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device)
         checkpoint_model_type = checkpoint.get("model_type")
-        if checkpoint_model_type != MODEL_TYPE:
+        if checkpoint_model_type != model_type:
             raise ValueError(
                 "Resume checkpoint is not compatible with the current model. "
-                f"checkpoint_model_type={checkpoint_model_type!r}, current_model_type={MODEL_TYPE!r}. "
+                f"checkpoint_model_type={checkpoint_model_type!r}, current_model_type={model_type!r}. "
                 "Train from scratch or resume from a checkpoint created by the current FCOS model."
             )
         checkpoint_preprocess = checkpoint.get("preprocess", "stretch")
@@ -432,6 +439,7 @@ def main() -> None:
     model = TinyGridDetector(
         num_classes=len(train_dataset.class_names),
         pretrained_backbone=True,
+        use_p2=use_p2,
     ).to(device)
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -492,8 +500,9 @@ def main() -> None:
         f"batch_size={args.batch_size} "
         f"gpus={gpu_count} "
         f"single_gpu={args.single_gpu} "
-        f"architecture={MODEL_TYPE} "
+        f"architecture={model_type} "
         f"preprocess={PREPROCESS_MODE} "
+        f"use_p2={use_p2} "
         f"pretrained_backbone=True "
         f"multi_scale=True "
         f"eval_map=True "
@@ -575,6 +584,8 @@ def main() -> None:
                     epoch,
                     best_val_loss,
                     best_metric=best_map,
+                    model_type=model_type,
+                    use_p2=use_p2,
                 )
             else:
                 epochs_without_improvement += 1

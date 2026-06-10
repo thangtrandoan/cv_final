@@ -8,7 +8,8 @@ from torch import nn
 
 
 LEVEL_SPECS = {
-    "p3": {"stride": 8, "min_size": 0.0, "max_size": 96.0},
+    "p2": {"stride": 4, "min_size": 0.0, "max_size": 64.0},
+    "p3": {"stride": 8, "min_size": 32.0, "max_size": 128.0},
     "p4": {"stride": 16, "min_size": 64.0, "max_size": 192.0},
     "p5": {"stride": 32, "min_size": 128.0, "max_size": float("inf")},
 }

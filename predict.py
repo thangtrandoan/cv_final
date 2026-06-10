@@ -274,6 +274,7 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location=device)
     class_names = checkpoint["class_names"]
     img_size = int(checkpoint.get("img_size", args.img_size))
+    use_p2 = bool(checkpoint.get("use_p2", checkpoint.get("model_type") == "fcos_resnet50_bifpn_p2"))
     preprocess = args.preprocess
     if preprocess == "auto":
         preprocess = str(checkpoint.get("preprocess", "stretch"))
@@ -284,6 +285,7 @@ def main() -> None:
         f"device={device} "
         f"image_dir={args.image_dir} "
         f"checkpoint={args.checkpoint} "
+        f"use_p2={use_p2} "
         f"preprocess={preprocess} "
         f"conf_threshold={args.conf_threshold} "
         f"max_detections_per_image={args.max_detections_per_image} "
@@ -298,6 +300,7 @@ def main() -> None:
     model = TinyGridDetector(
         num_classes=len(class_names),
         pretrained_backbone=False,
+        use_p2=use_p2,
     ).to(device)
     if channels_last:
         model = model.to(memory_format=torch.channels_last)

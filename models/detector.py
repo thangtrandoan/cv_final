@@ -31,6 +31,15 @@ class ConvBlock(nn.Module):
         return self.block(x)
 
 
+class Scale(nn.Module):
+    def __init__(self, init_value: float = 1.0) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(float(init_value)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale
+
+
 class FCOSHead(nn.Module):
     def __init__(self, in_channels: int = 256, num_classes: int = 5) -> None:
         super().__init__()
@@ -51,11 +60,14 @@ class FCOSHead(nn.Module):
         self.cnt_head = nn.Conv2d(in_channels, 1, kernel_size=3, padding=1)
         self._init_weights()
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, scale: Scale | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cls_features = self.cls_tower(x)
         reg_features = self.reg_tower(x)
         cls_logits = self.cls_head(cls_features)
-        reg_preds = F.softplus(self.reg_head(reg_features))
+        raw_reg = self.reg_head(reg_features)
+        if scale is not None:
+            raw_reg = scale(raw_reg)
+        reg_preds = F.softplus(raw_reg)
         cnt_logits = self.cnt_head(reg_features)
         return cls_logits, reg_preds, cnt_logits
 
@@ -71,7 +83,7 @@ class FCOSHead(nn.Module):
 
 
 class TinyGridDetector(nn.Module):
-    level_strides = {"p2": 4, "p3": 8, "p4": 16, "p5": 32}
+    level_strides = {"p2": 4, "p3": 8, "p4": 16, "p5": 32, "p6": 64}
 
     def __init__(
         self,
@@ -79,10 +91,14 @@ class TinyGridDetector(nn.Module):
         num_anchors: int = 3,
         pretrained_backbone: bool = True,
         use_p2: bool = False,
+        use_p6: bool = False,
+        use_scales: bool = False,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.use_p2 = use_p2
+        self.use_p6 = use_p6
+        self.use_scales = use_scales
         weights = ResNet50_Weights.DEFAULT if pretrained_backbone else None
         backbone = resnet50(weights=weights)
 
@@ -104,7 +120,19 @@ class TinyGridDetector(nn.Module):
         self.p3_smooth = ConvBlock(256, 256)
         self.p4_out_smooth = ConvBlock(256, 256)
         self.p5_out_smooth = ConvBlock(256, 256)
+        if self.use_p6:
+            self.p6_out_smooth = nn.Sequential(
+                nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.GroupNorm(32, 256),
+                nn.ReLU(inplace=True),
+            )
         self.head = FCOSHead(256, num_classes)
+        if self.use_scales:
+            self.scales = nn.ModuleDict({level: Scale(1.0) for level in self.level_strides})
+
+    def _head(self, level: str, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        scale = self.scales[level] if self.use_scales else None
+        return self.head(feature, scale)
 
     def forward(self, x: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         x = self.stem(x)
@@ -126,10 +154,12 @@ class TinyGridDetector(nn.Module):
         p5_out = self.p5_out_smooth(p5_td + F.max_pool2d(p4_out, kernel_size=2, stride=2))
 
         outputs = {
-            "p3": self.head(p3_out),
-            "p4": self.head(p4_out),
-            "p5": self.head(p5_out),
+            "p3": self._head("p3", p3_out),
+            "p4": self._head("p4", p4_out),
+            "p5": self._head("p5", p5_out),
         }
         if p2_out is not None:
-            outputs = {"p2": self.head(p2_out), **outputs}
+            outputs = {"p2": self._head("p2", p2_out), **outputs}
+        if self.use_p6:
+            outputs["p6"] = self._head("p6", self.p6_out_smooth(p5_out))
         return outputs

@@ -24,9 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--checkpoint", type=Path, default=Path("./models/best.pth"))
     parser.add_argument("--img_size", type=int, default=512)
-    parser.add_argument("--conf_threshold", type=float, default=0.45)
+    parser.add_argument("--conf_threshold", type=float, default=0.05)
     parser.add_argument("--nms_threshold", type=float, default=0.45)
-    parser.add_argument("--max_detections_per_image", type=int, default=20)
+    parser.add_argument("--max_detections_per_image", type=int, default=30)
     parser.add_argument("--pre_nms_topk", type=int, default=1000)
     parser.add_argument("--preprocess", choices=("auto", "letterbox", "stretch"), default="auto")
     parser.add_argument("--disable_tta", action="store_true")
@@ -275,6 +275,8 @@ def main() -> None:
     class_names = checkpoint["class_names"]
     img_size = int(checkpoint.get("img_size", args.img_size))
     use_p2 = bool(checkpoint.get("use_p2", checkpoint.get("model_type") == "fcos_resnet50_bifpn_p2"))
+    use_p6 = bool(checkpoint.get("use_p6", checkpoint.get("model_type") == "fcos_resnet50_bifpn_p6_scale"))
+    use_scales = bool(checkpoint.get("use_scales", checkpoint.get("model_type") == "fcos_resnet50_bifpn_p6_scale"))
     preprocess = args.preprocess
     if preprocess == "auto":
         preprocess = str(checkpoint.get("preprocess", "stretch"))
@@ -286,6 +288,8 @@ def main() -> None:
         f"image_dir={args.image_dir} "
         f"checkpoint={args.checkpoint} "
         f"use_p2={use_p2} "
+        f"use_p6={use_p6} "
+        f"use_scales={use_scales} "
         f"preprocess={preprocess} "
         f"conf_threshold={args.conf_threshold} "
         f"max_detections_per_image={args.max_detections_per_image} "
@@ -301,6 +305,8 @@ def main() -> None:
         num_classes=len(class_names),
         pretrained_backbone=False,
         use_p2=use_p2,
+        use_p6=use_p6,
+        use_scales=use_scales,
     ).to(device)
     if channels_last:
         model = model.to(memory_format=torch.channels_last)

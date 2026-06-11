@@ -11,8 +11,19 @@ LEVEL_SPECS = {
     "p2": {"stride": 4, "min_size": 0.0, "max_size": 64.0},
     "p3": {"stride": 8, "min_size": 32.0, "max_size": 128.0},
     "p4": {"stride": 16, "min_size": 64.0, "max_size": 192.0},
-    "p5": {"stride": 32, "min_size": 128.0, "max_size": float("inf")},
+    "p5": {"stride": 32, "min_size": 128.0, "max_size": 384.0},
+    "p6": {"stride": 64, "min_size": 256.0, "max_size": float("inf")},
 }
+
+
+def level_spec_for(level: str, active_levels: set[str]) -> dict[str, float]:
+    spec = dict(LEVEL_SPECS[level])
+    if "p2" not in active_levels and level == "p3":
+        spec["min_size"] = 0.0
+        spec["max_size"] = 96.0
+    if "p6" not in active_levels and level == "p5":
+        spec["max_size"] = float("inf")
+    return spec
 
 
 def focal_loss(
@@ -94,9 +105,11 @@ def encode_fcos_targets(
     device: torch.device,
 ) -> dict[str, dict[str, torch.Tensor]]:
     encoded: dict[str, dict[str, torch.Tensor]] = {}
+    active_levels = set(outputs)
     for level, (cls_logits, _, _) in outputs.items():
         batch_size, _, height, width = cls_logits.shape
-        stride = LEVEL_SPECS[level]["stride"]
+        level_spec = level_spec_for(level, active_levels)
+        stride = level_spec["stride"]
         cls_target = torch.zeros((batch_size, num_classes, height, width), device=device)
         reg_target = torch.zeros((batch_size, 4, height, width), device=device)
         cnt_target = torch.zeros((batch_size, 1, height, width), device=device)
@@ -115,7 +128,7 @@ def encode_fcos_targets(
                 if box_w <= 0 or box_h <= 0:
                     continue
                 max_side = max(box_w, box_h)
-                if max_side < LEVEL_SPECS[level]["min_size"] or max_side > LEVEL_SPECS[level]["max_size"]:
+                if max_side < level_spec["min_size"] or max_side > level_spec["max_size"]:
                     continue
 
                 left = xx - xmin

@@ -25,6 +25,7 @@ MAP_PRE_NMS_TOPK = 300
 EVAL_MAP_EVERY = 3
 MODEL_TYPE_BASE = "fcos_resnet50_bifpn"
 MODEL_TYPE_P2 = "fcos_resnet50_bifpn_p2"
+MODEL_TYPE_P6_SCALE = "fcos_resnet50_bifpn_p6_scale"
 PREPROCESS_MODE = "letterbox"
 
 
@@ -65,13 +66,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--map_pre_nms_topk", type=int, default=MAP_PRE_NMS_TOPK)
     parser.add_argument("--eval_map_every", type=int, default=EVAL_MAP_EVERY)
+    parser.add_argument("--scheduler", choices=("plateau", "onecycle"), default="plateau")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_channels_last", action="store_true")
     parser.add_argument("--single_gpu", action="store_true")
     parser.add_argument("--disable_class_aware_sampler", action="store_true")
+    parser.add_argument("--enable_p2", action="store_true")
     parser.add_argument("--disable_p2", action="store_true")
+    parser.add_argument("--disable_p6", action="store_true")
+    parser.add_argument("--disable_level_scales", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume_from_best", action="store_true")
+    parser.add_argument("--resume_from_last", action="store_true")
     parser.add_argument("--resume_checkpoint", type=Path)
     return parser.parse_args()
 
@@ -141,6 +147,7 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
+    step_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     use_amp: bool = False,
     channels_last: bool = False,
 ) -> dict[str, float]:
@@ -169,6 +176,8 @@ def run_epoch(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
+            if step_scheduler is not None:
+                step_scheduler.step()
 
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -343,6 +352,8 @@ def save_checkpoint(
     best_metric: float,
     model_type: str,
     use_p2: bool,
+    use_p6: bool,
+    use_scales: bool,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
@@ -360,6 +371,8 @@ def save_checkpoint(
             "model_type": model_type,
             "preprocess": PREPROCESS_MODE,
             "use_p2": use_p2,
+            "use_p6": use_p6,
+            "use_scales": use_scales,
         },
         path,
     )
@@ -368,8 +381,15 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
-    use_p2 = not args.disable_p2
-    model_type = MODEL_TYPE_P2 if use_p2 else MODEL_TYPE_BASE
+    use_p2 = args.enable_p2 and not args.disable_p2
+    use_p6 = not args.disable_p6 and not use_p2
+    use_scales = not args.disable_level_scales
+    if use_p2:
+        model_type = MODEL_TYPE_P2
+    elif use_p6 or use_scales:
+        model_type = MODEL_TYPE_P6_SCALE
+    else:
+        model_type = MODEL_TYPE_BASE
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -377,11 +397,15 @@ def main() -> None:
     use_amp = device.type == "cuda" and not args.no_amp
     channels_last = device.type == "cuda" and not args.no_channels_last
     best_path = args.checkpoint_dir / "best.pth"
+    last_path = args.checkpoint_dir / "last.pth"
     resume_path = args.resume_checkpoint
     if args.resume_from_best:
         resume_path = best_path
-    if args.resume_from_best and args.resume_checkpoint:
-        raise ValueError("Use either --resume_from_best or --resume_checkpoint, not both.")
+    if args.resume_from_last:
+        resume_path = last_path
+    resume_option_count = int(args.resume_checkpoint is not None) + int(args.resume_from_best) + int(args.resume_from_last)
+    if resume_option_count > 1:
+        raise ValueError("Use only one of --resume_from_best, --resume_from_last, or --resume_checkpoint.")
     checkpoint = None
     if resume_path is not None:
         if not resume_path.exists():
@@ -440,6 +464,8 @@ def main() -> None:
         num_classes=len(train_dataset.class_names),
         pretrained_backbone=True,
         use_p2=use_p2,
+        use_p6=use_p6,
+        use_scales=use_scales,
     ).to(device)
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -457,15 +483,26 @@ def main() -> None:
         lambda_noobj=args.lambda_noobj,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.1,
-        patience=5,
-        threshold=0.01,
-        threshold_mode="rel",
-        min_lr=1e-6,
-    )
+    if args.scheduler == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr,
+            epochs=args.epochs,
+            steps_per_epoch=max(1, len(train_loader)),
+            pct_start=0.15,
+            div_factor=10,
+            final_div_factor=100,
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.1,
+            patience=5,
+            threshold=0.01,
+            threshold_mode="rel",
+            min_lr=1e-6,
+        )
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     start_epoch = 1
@@ -503,10 +540,13 @@ def main() -> None:
         f"architecture={model_type} "
         f"preprocess={PREPROCESS_MODE} "
         f"use_p2={use_p2} "
+        f"use_p6={use_p6} "
+        f"use_scales={use_scales} "
         f"pretrained_backbone=True "
         f"multi_scale=True "
         f"eval_map=True "
         f"eval_map_every={args.eval_map_every} "
+        f"scheduler={args.scheduler} "
         f"amp={use_amp} "
         f"channels_last={channels_last} "
         f"class_aware_sampler={sampler is not None} "
@@ -515,7 +555,8 @@ def main() -> None:
         f"early_stopping_patience={args.early_stopping_patience} "
         f"train_images={len(train_dataset)} "
         f"val_images={len(val_dataset)} "
-        f"checkpoint={best_path}",
+        f"best_checkpoint={best_path} "
+        f"last_checkpoint={last_path}",
         flush=True,
     )
     end_epoch = start_epoch + args.epochs - 1
@@ -534,6 +575,7 @@ def main() -> None:
             device,
             optimizer,
             scaler=scaler,
+            step_scheduler=scheduler if args.scheduler == "onecycle" else None,
             use_amp=use_amp,
             channels_last=channels_last,
         )
@@ -555,7 +597,8 @@ def main() -> None:
                     channels_last=channels_last,
                 )
             val_loss = val_metrics["loss"]
-            scheduler.step(val_loss)
+            if args.scheduler == "plateau":
+                scheduler.step(val_loss)
             map_metrics = evaluate_map(
                 model=model,
                 dataloader=val_loader,
@@ -586,11 +629,30 @@ def main() -> None:
                     best_metric=best_map,
                     model_type=model_type,
                     use_p2=use_p2,
+                    use_p6=use_p6,
+                    use_scales=use_scales,
                 )
             else:
                 epochs_without_improvement += 1
         else:
             current_lr = optimizer.param_groups[0]["lr"]
+
+        save_checkpoint(
+            last_path,
+            model,
+            optimizer,
+            scheduler,
+            train_dataset.class_names,
+            args.img_size,
+            args.img_size // 32,
+            epoch,
+            best_val_loss,
+            best_metric=best_map,
+            model_type=model_type,
+            use_p2=use_p2,
+            use_p6=use_p6,
+            use_scales=use_scales,
+        )
 
         message = (
             f"epoch={epoch:03d} "
@@ -626,6 +688,7 @@ def main() -> None:
             break
 
     print(f"Best checkpoint saved to {best_path}")
+    print(f"Last checkpoint saved to {last_path}")
 
 
 if __name__ == "__main__":

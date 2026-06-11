@@ -166,17 +166,20 @@ def run_epoch(
             raw = model(images)
             loss, metrics = criterion(raw, targets)
         if training:
+            optimizer_stepped = True
             if scaler is not None and use_amp:
+                scale_before = scaler.get_scale()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer_stepped = scaler.get_scale() >= scale_before
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
-            if step_scheduler is not None:
+            if step_scheduler is not None and optimizer_stepped:
                 step_scheduler.step()
 
         for key, value in metrics.items():

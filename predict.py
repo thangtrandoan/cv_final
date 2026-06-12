@@ -8,15 +8,16 @@ import torch
 from PIL import Image, ImageEnhance
 
 from models.detector import TinyGridDetector
+from utils.box_ops import box_iou
 from utils.json_utils import write_json
-from utils.loss import LEVEL_SPECS
+from utils.loss import flatten_fcos_outputs, make_fcos_points
 from utils.nms import nms
 
 
-TTA_BRIGHTNESS_FACTORS = [0.85, 1.15]
+TTA_BRIGHTNESS_FACTORS: list[float] = []
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
-LETTERBOX_FILL = tuple(int(round(value * 255)) for value in (0.485, 0.456, 0.406))
+LETTERBOX_FILL = (114, 114, 114)
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,14 +25,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--checkpoint", type=Path, default=Path("./models/best.pth"))
-    parser.add_argument("--img_size", type=int, default=512)
-    parser.add_argument("--conf_threshold", type=float, default=0.05)
-    parser.add_argument("--nms_threshold", type=float, default=0.45)
-    parser.add_argument("--max_detections_per_image", type=int, default=30)
-    parser.add_argument("--pre_nms_topk", type=int, default=1000)
+    parser.add_argument("--img_size", type=int, default=640)
+    parser.add_argument("--conf_threshold", type=float, default=0.005)
+    parser.add_argument("--nms_threshold", type=float, default=0.55)
+    parser.add_argument("--max_detections_per_image", type=int, default=300)
+    parser.add_argument("--pre_nms_topk", type=int, default=1500)
     parser.add_argument("--preprocess", choices=("auto", "letterbox", "stretch"), default="auto")
     parser.add_argument("--disable_tta", action="store_true")
+    parser.add_argument("--tta_img_sizes", nargs="*", type=int)
     parser.add_argument("--tta_brightness", nargs="*", type=float, default=TTA_BRIGHTNESS_FACTORS)
+    parser.add_argument("--merge_method", choices=("wbf", "nms"), default="wbf")
+    parser.add_argument("--wbf_iou_threshold", type=float, default=0.55)
     parser.add_argument("--progress_every", type=int, default=100)
     parser.add_argument("--no_channels_last", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -106,72 +110,70 @@ def predict_image(
     if channels_last:
         tensor = tensor.contiguous(memory_format=torch.channels_last)
     outputs = model(tensor)
-
+    cls_logits, reg_preds, cnt_logits = flatten_fcos_outputs(outputs)
+    points, strides, _ = make_fcos_points(outputs, device)
+    probs = torch.sigmoid(cls_logits[0]) * torch.sqrt(torch.sigmoid(cnt_logits[0]).clamp(min=0.0)).unsqueeze(-1)
+    num_classes = len(class_names)
+    scores, flat_indices = torch.topk(
+        probs.reshape(-1),
+        k=min(pre_nms_topk, probs.shape[0] * probs.shape[1]) if pre_nms_topk > 0 else probs.shape[0] * probs.shape[1],
+    )
+    keep = scores >= conf_threshold
     output_boxes: list[dict[str, object]] = []
-    for level, (cls_logits, reg_preds, cnt_logits) in outputs.items():
-        stride = LEVEL_SPECS[level]["stride"]
-        cls_scores = torch.sigmoid(cls_logits[0])
-        cnt_scores = torch.sigmoid(cnt_logits[0])
-        scores_per_class = torch.sqrt((cls_scores * cnt_scores).clamp(min=0.0))
-        scores, class_ids = scores_per_class.reshape(len(class_names), -1).max(dim=0)
-        candidate_indices = torch.arange(scores.numel(), device=device)
-        if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
-            scores, topk_indices = scores.topk(pre_nms_topk)
-            class_ids = class_ids[topk_indices]
-            candidate_indices = topk_indices
-        keep = scores >= conf_threshold
-        if not keep.any():
-            continue
-        scores = scores[keep]
-        class_ids = class_ids[keep]
-        candidate_indices = candidate_indices[keep]
-
-        _, height, width = cls_logits.shape[1:]
-        shifts_x = (torch.arange(width, device=device, dtype=torch.float32) + 0.5) * stride
-        shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride
-        yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
-        points = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)[candidate_indices]
-        distances = reg_preds[0].permute(1, 2, 0).reshape(-1, 4)[candidate_indices] * stride
-        boxes = torch.stack(
-            (
-                points[:, 0] - distances[:, 0],
-                points[:, 1] - distances[:, 1],
-                points[:, 0] + distances[:, 2],
-                points[:, 1] + distances[:, 3],
-            ),
-            dim=1,
+    if not keep.any():
+        return {"image_id": image_id, "boxes": output_boxes}
+    scores = scores[keep]
+    flat_indices = flat_indices[keep]
+    point_indices = flat_indices // num_classes
+    class_ids = flat_indices % num_classes
+    distances = reg_preds[0, point_indices] * strides[point_indices, None]
+    selected_points = points[point_indices]
+    boxes = torch.stack(
+        (
+            selected_points[:, 0] - distances[:, 0],
+            selected_points[:, 1] - distances[:, 1],
+            selected_points[:, 0] + distances[:, 2],
+            selected_points[:, 1] + distances[:, 3],
+        ),
+        dim=1,
+    )
+    if preprocess == "letterbox":
+        boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
+        boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
+    else:
+        resize_scale = torch.tensor(
+            [original_w / img_size, original_h / img_size, original_w / img_size, original_h / img_size],
+            device=device,
+            dtype=torch.float32,
         )
-        if preprocess == "letterbox":
-            boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
-            boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
-        else:
-            resize_scale = torch.tensor(
-                [original_w / img_size, original_h / img_size, original_w / img_size, original_h / img_size],
-                device=device,
-                dtype=torch.float32,
-            )
-            boxes = boxes * resize_scale
-        boxes = boxes.clamp(min=0)
-        boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(max=original_w)
-        boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(max=original_h)
+        boxes = boxes * resize_scale
+    boxes = boxes.clamp(min=0)
+    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(max=original_w)
+    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(max=original_h)
+    valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    if not valid.any():
+        return {"image_id": image_id, "boxes": output_boxes}
+    boxes = boxes[valid]
+    scores = scores[valid]
+    class_ids = class_ids[valid]
 
-        for class_id in class_ids.unique():
-            class_mask = class_ids == class_id
-            selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
-            class_boxes = boxes[class_mask][selected]
-            class_scores_selected = scores[class_mask][selected]
-            for box, score in zip(class_boxes, class_scores_selected):
-                xmin, ymin, xmax, ymax = box.tolist()
-                bbox = rounded_valid_bbox([xmin, ymin, xmax, ymax], original_w, original_h)
-                if bbox is None:
-                    continue
-                output_boxes.append(
-                    {
-                        "class": class_names[int(class_id.item())],
-                        "confidence": round(float(score.item()), 6),
-                        "bbox": bbox,
-                    }
-                )
+    for class_id in class_ids.unique():
+        class_mask = class_ids == class_id
+        selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
+        class_boxes = boxes[class_mask][selected]
+        class_scores_selected = scores[class_mask][selected]
+        for box, score in zip(class_boxes, class_scores_selected):
+            xmin, ymin, xmax, ymax = box.tolist()
+            bbox = rounded_valid_bbox([xmin, ymin, xmax, ymax], original_w, original_h)
+            if bbox is None:
+                continue
+            output_boxes.append(
+                {
+                    "class": class_names[int(class_id.item())],
+                    "confidence": round(float(score.item()), 6),
+                    "bbox": bbox,
+                }
+            )
 
     output_boxes.sort(key=lambda item: item["confidence"], reverse=True)
     return {"image_id": image_id, "boxes": output_boxes}
@@ -207,16 +209,72 @@ def merge_boxes(
     return {"image_id": image_id, "boxes": merged[:max_detections_per_image]}
 
 
+def weighted_fusion_boxes(
+    image_id: str,
+    boxes: list[dict[str, object]],
+    class_names: list[str],
+    iou_threshold: float,
+    max_detections_per_image: int,
+    device: torch.device,
+) -> dict[str, object]:
+    if not boxes:
+        return {"image_id": image_id, "boxes": []}
+
+    fused: list[dict[str, object]] = []
+    for class_name in class_names:
+        class_boxes = [
+            box
+            for box in boxes
+            if box["class"] == class_name and rounded_valid_bbox([float(value) for value in box["bbox"]]) is not None
+        ]
+        if not class_boxes:
+            continue
+        box_tensor = torch.tensor([box["bbox"] for box in class_boxes], dtype=torch.float32, device=device)
+        score_tensor = torch.tensor([box["confidence"] for box in class_boxes], dtype=torch.float32, device=device)
+        order = score_tensor.argsort(descending=True)
+
+        while order.numel() > 0:
+            current = order[0]
+            if order.numel() == 1:
+                cluster_indices = current.unsqueeze(0)
+                order = order[1:]
+            else:
+                ious = box_iou(box_tensor[current].unsqueeze(0), box_tensor[order]).squeeze(0)
+                cluster_mask = ious >= iou_threshold
+                cluster_indices = order[cluster_mask]
+                order = order[~cluster_mask]
+
+            cluster_boxes = box_tensor[cluster_indices]
+            cluster_scores = score_tensor[cluster_indices]
+            weights = cluster_scores.clamp(min=1e-6)
+            fused_box = (cluster_boxes * weights[:, None]).sum(dim=0) / weights.sum()
+            bbox = rounded_valid_bbox(fused_box.tolist())
+            if bbox is None:
+                continue
+            fused.append(
+                {
+                    "class": class_name,
+                    "confidence": round(float(cluster_scores.max().item()), 6),
+                    "bbox": bbox,
+                }
+            )
+
+    fused.sort(key=lambda item: item["confidence"], reverse=True)
+    return {"image_id": image_id, "boxes": fused[:max_detections_per_image]}
+
+
 def predict_with_tta(
     model: TinyGridDetector,
     image_path: Path,
     class_names: list[str],
-    img_size: int,
+    img_sizes: list[int],
     conf_threshold: float,
     nms_threshold: float,
     max_detections_per_image: int,
     pre_nms_topk: int,
     brightness_factors: list[float],
+    merge_method: str,
+    wbf_iou_threshold: float,
     device: torch.device,
     preprocess: str,
     use_tta: bool,
@@ -226,13 +284,15 @@ def predict_with_tta(
     original_w, original_h = image.size
     all_boxes: list[dict[str, object]] = []
 
-    variants: list[tuple[Image.Image, bool]] = [(image, False)]
-    if use_tta:
-        variants.append((image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), True))
-        for factor in brightness_factors:
-            variants.append((ImageEnhance.Brightness(image).enhance(factor), False))
+    variants: list[tuple[Image.Image, bool, int]] = []
+    for img_size in img_sizes:
+        variants.append((image, False, img_size))
+        if use_tta:
+            variants.append((image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), True, img_size))
+            for factor in brightness_factors:
+                variants.append((ImageEnhance.Brightness(image).enhance(factor), False, img_size))
 
-    for variant, flipped in variants:
+    for variant, flipped, img_size in variants:
         prediction = predict_image(
             model,
             variant,
@@ -256,6 +316,15 @@ def predict_with_tta(
                 box["bbox"] = bbox
             all_boxes.append(box)
 
+    if merge_method == "wbf":
+        return weighted_fusion_boxes(
+            image_path.name,
+            all_boxes,
+            class_names,
+            wbf_iou_threshold,
+            max_detections_per_image,
+            device,
+        )
     return merge_boxes(
         image_path.name,
         all_boxes,
@@ -279,13 +348,23 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location=device)
     class_names = checkpoint["class_names"]
     img_size = int(checkpoint.get("img_size", args.img_size))
+    checkpoint_model_type = checkpoint.get("model_type")
     use_p2 = bool(checkpoint.get("use_p2", checkpoint.get("model_type") == "fcos_resnet50_bifpn_p2"))
-    use_p6 = bool(checkpoint.get("use_p6", checkpoint.get("model_type") == "fcos_resnet50_bifpn_p6_scale"))
-    use_scales = bool(checkpoint.get("use_scales", checkpoint.get("model_type") == "fcos_resnet50_bifpn_p6_scale"))
+    use_p6 = bool(checkpoint.get("use_p6", checkpoint_model_type in {"fcos_resnet50_bifpn_p6_scale", "fcos_resnet50_fpn_p6_scale_v4"}))
+    use_scales = bool(checkpoint.get("use_scales", checkpoint_model_type in {"fcos_resnet50_bifpn_p6_scale", "fcos_resnet50_fpn_p6_scale_v4"}))
+    channels = int(checkpoint.get("channels", 256 if checkpoint_model_type == "fcos_resnet50_bifpn" else 128))
+    use_bifpn = bool(checkpoint.get("use_bifpn", checkpoint_model_type == "fcos_resnet50_bifpn"))
     preprocess = args.preprocess
     if preprocess == "auto":
         preprocess = str(checkpoint.get("preprocess", "stretch"))
     use_tta = not args.disable_tta
+    if args.tta_img_sizes is None:
+        tta_img_sizes = [img_size, 704] if use_tta and img_size == 640 else [img_size]
+    else:
+        tta_img_sizes = args.tta_img_sizes or [img_size]
+    invalid_sizes = [size for size in tta_img_sizes if size <= 0 or size % 32 != 0]
+    if invalid_sizes:
+        raise ValueError(f"TTA image sizes must be positive multiples of 32: {invalid_sizes}")
     channels_last = device.type == "cuda" and not args.no_channels_last
     print(
         "Starting prediction "
@@ -295,12 +374,17 @@ def main() -> None:
         f"use_p2={use_p2} "
         f"use_p6={use_p6} "
         f"use_scales={use_scales} "
+        f"channels={channels} "
+        f"use_bifpn={use_bifpn} "
         f"preprocess={preprocess} "
         f"conf_threshold={args.conf_threshold} "
         f"max_detections_per_image={args.max_detections_per_image} "
         f"pre_nms_topk={args.pre_nms_topk} "
         f"tta={use_tta} "
+        f"tta_img_sizes={tta_img_sizes} "
         f"tta_brightness={args.tta_brightness} "
+        f"merge_method={args.merge_method} "
+        f"wbf_iou_threshold={args.wbf_iou_threshold} "
         f"channels_last={channels_last} "
         f"output={args.output}",
         flush=True,
@@ -312,6 +396,8 @@ def main() -> None:
         use_p2=use_p2,
         use_p6=use_p6,
         use_scales=use_scales,
+        channels=channels,
+        use_bifpn=use_bifpn,
     ).to(device)
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -332,12 +418,14 @@ def main() -> None:
                 model,
                 image_path,
                 class_names,
-                img_size,
+                tta_img_sizes,
                 args.conf_threshold,
                 args.nms_threshold,
                 args.max_detections_per_image,
                 args.pre_nms_topk,
                 args.tta_brightness,
+                args.merge_method,
+                args.wbf_iou_threshold,
                 device,
                 preprocess,
                 use_tta,

@@ -60,18 +60,20 @@ Toa do bbox la toa do tren anh goc.
 `TinyGridDetector` la detector anchor-free theo huong FCOS:
 
 - Backbone: ResNet50 pretrained.
-- Neck: FPN/BiFPN nhe.
+- Neck: FPN nhe, mac dinh co P6 stride 64.
 - Head: classification tower, box regression tower, centerness head.
 - Output moi level gom:
   - class logits
   - box distances `[left, top, right, bottom]`
   - centerness/objectness
 
-Checkpoint moi co the luu them cac tuy chon kien truc:
+Checkpoint luu them cac tuy chon kien truc:
 
 - `use_p2`
 - `use_p6`
 - `use_scales`
+- `channels`
+- `use_bifpn`
 - `preprocess`
 - `model_type`
 
@@ -93,9 +95,9 @@ Pipeline du lieu co:
 Loss gom cac thanh phan:
 
 - Focal loss cho classification.
-- CIoU loss cho box regression.
+- GIoU loss cho box regression.
 - BCEWithLogits cho centerness.
-- Class weight tu thong ke tap train, co boost nhe cho `chair`.
+- Co tuy chon class weight/boost cho `chair`, mac dinh tat de giam bias.
 
 ## Train
 
@@ -139,18 +141,34 @@ python train.py \
   --val_image_dir /kaggle/input/datasets/trandthang/final-public/public/val/images \
   --checkpoint_dir ./models/ \
   --img_size 640 \
+  --multi_scale_min 640 \
+  --multi_scale_max 640 \
   --batch_size 16 \
-  --val_batch_size 32 \
+  --val_batch_size 16 \
   --lr 1.5e-4 \
   --scheduler onecycle \
-  --eval_map_every 5 \
-  --early_stopping_patience 10
+  --eval_map_every 1 \
+  --early_stopping_patience 6
 ```
 
-Neu can quay ve baseline cu:
+Mac dinh train moi dung cau hinh toi uu mAP hon:
+
+- `img_size=640`
+- fixed scale `640`
+- `epochs=16`
+- `channels=128`
+- `scheduler=onecycle`
+- `map_nms_threshold=0.55`
+- `map_conf_threshold=0.005`
+- `map_pre_nms_topk=1500`
+- `map_max_detections_per_image=300`
+- EMA bat mac dinh, `best.pth` duoc chon/evaluate bang EMA weights
+- khong bat class-aware sampler va class weights mac dinh
+
+Neu can quay ve baseline cu nang hon:
 
 ```bash
---disable_p6 --disable_level_scales
+--disable_p6 --disable_level_scales --channels 256 --enable_bifpn
 ```
 
 ## Predict
@@ -166,17 +184,21 @@ python predict.py \
 Mac dinh:
 
 - `--checkpoint ./models/best.pth`
-- `--conf_threshold 0.05`
-- `--max_detections_per_image 30`
-- TTA bat mac dinh
+- `--conf_threshold 0.005`
+- `--max_detections_per_image 300`
+- TTA flip ngang bat mac dinh
+- voi checkpoint 640, mac dinh predict dung multi-scale TTA `640` va `704`
+- merge TTA bang weighted box fusion (`--merge_method wbf`)
 
-Co the tat TTA de chay nhanh:
+Co the tat TTA hoac chay mot scale de nhanh hon:
 
 ```bash
 python predict.py \
   --image_dir ./public/val/images \
   --output val_predictions.json \
-  --disable_tta
+  --disable_tta \
+  --tta_img_sizes 640 \
+  --merge_method nms
 ```
 
 ## Output

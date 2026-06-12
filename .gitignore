@@ -65,4 +65,5 @@ public/
 
 error_analysis.json
 tmp_predictions_check.json
+tmp_predictions_check_*.json
 tmp_predict_check/

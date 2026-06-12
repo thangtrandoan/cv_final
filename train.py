@@ -12,22 +12,72 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from models.detector import TinyGridDetector
 from utils.dataset import ObjectDetectionDataset, collate_fn
-from utils.loss import DetectionLoss, LEVEL_SPECS
+from utils.loss import DetectionLoss, flatten_fcos_outputs, make_fcos_points
 from utils.nms import nms
 
 
-MULTI_SCALE_MIN = 384
-MULTI_SCALE_MAX = 512
-EARLY_STOPPING_PATIENCE = 50
-MAP_CONF_THRESHOLD = 0.05
-MAP_NMS_THRESHOLD = 0.45
-MAP_MAX_DETECTIONS_PER_IMAGE = 30
-MAP_PRE_NMS_TOPK = 1000
-EVAL_MAP_EVERY = 3
+MULTI_SCALE_MIN = 640
+MULTI_SCALE_MAX = 640
+EARLY_STOPPING_PATIENCE = 6
+MAP_CONF_THRESHOLD = 0.005
+MAP_NMS_THRESHOLD = 0.55
+MAP_MAX_DETECTIONS_PER_IMAGE = 300
+MAP_PRE_NMS_TOPK = 1500
+EVAL_MAP_EVERY = 1
 MODEL_TYPE_BASE = "fcos_resnet50_bifpn"
 MODEL_TYPE_P2 = "fcos_resnet50_bifpn_p2"
-MODEL_TYPE_P6_SCALE = "fcos_resnet50_bifpn_p6_scale"
+MODEL_TYPE_P6_SCALE = "fcos_resnet50_fpn_p6_scale_v4"
 PREPROCESS_MODE = "letterbox"
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9998) -> None:
+        self.decay = decay
+        self.num_updates = 0
+        self.shadow = {
+            key: value.detach().clone()
+            for key, value in unwrap_model(model).state_dict().items()
+        }
+        self.backup: dict[str, torch.Tensor] | None = None
+
+    def update(self, model: torch.nn.Module) -> None:
+        self.num_updates += 1
+        decay = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        model_state = unwrap_model(model).state_dict()
+        for key, value in model_state.items():
+            value = value.detach()
+            if torch.is_floating_point(value):
+                self.shadow[key].mul_(decay).add_(value, alpha=1.0 - decay)
+            else:
+                self.shadow[key].copy_(value)
+
+    def store(self, model: torch.nn.Module) -> None:
+        self.backup = {
+            key: value.detach().clone()
+            for key, value in unwrap_model(model).state_dict().items()
+        }
+
+    def copy_to(self, model: torch.nn.Module) -> None:
+        unwrap_model(model).load_state_dict(self.shadow, strict=True)
+
+    def restore(self, model: torch.nn.Module) -> None:
+        if self.backup is None:
+            return
+        unwrap_model(model).load_state_dict(self.backup, strict=True)
+        self.backup = None
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], num_updates: int = 0) -> None:
+        self.num_updates = num_updates
+        for key, value in state_dict.items():
+            if key in self.shadow:
+                self.shadow[key].copy_(value.detach().to(self.shadow[key].device))
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {key: value.detach().clone() for key, value in self.shadow.items()}
 
 
 def format_duration(seconds: float) -> str:
@@ -48,17 +98,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_dir", required=True, type=Path)
     parser.add_argument("--val_image_dir", required=True, type=Path)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models/"))
-    parser.add_argument("--img_size", type=int, default=512)
-    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--img_size", type=int, default=640)
+    parser.add_argument("--epochs", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--val_batch_size", type=int)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1.5e-4)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lambda_noobj", type=float, default=2.0)
-    parser.add_argument("--chair_loss_boost", type=float, default=1.5)
+    parser.add_argument("--chair_loss_boost", type=float, default=1.0)
     parser.add_argument("--multi_scale_min", type=int, default=MULTI_SCALE_MIN)
     parser.add_argument("--multi_scale_max", type=int, default=MULTI_SCALE_MAX)
     parser.add_argument("--early_stopping_patience", type=int, default=EARLY_STOPPING_PATIENCE)
+    parser.add_argument("--min_epochs", type=int, default=8)
     parser.add_argument("--map_conf_threshold", type=float, default=MAP_CONF_THRESHOLD)
     parser.add_argument("--map_nms_threshold", type=float, default=MAP_NMS_THRESHOLD)
     parser.add_argument(
@@ -68,16 +120,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--map_pre_nms_topk", type=int, default=MAP_PRE_NMS_TOPK)
     parser.add_argument("--eval_map_every", type=int, default=EVAL_MAP_EVERY)
-    parser.add_argument("--scheduler", choices=("plateau", "onecycle"), default="plateau")
+    parser.add_argument("--scheduler", choices=("plateau", "onecycle"), default="onecycle")
     parser.add_argument("--skip_val_loss", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_channels_last", action="store_true")
+    parser.add_argument("--disable_ema", action="store_true")
+    parser.add_argument("--ema_decay", type=float, default=0.9998)
     parser.add_argument("--single_gpu", action="store_true")
+    parser.add_argument("--enable_class_aware_sampler", action="store_true")
     parser.add_argument("--disable_class_aware_sampler", action="store_true")
+    parser.add_argument("--enable_class_weights", action="store_true")
     parser.add_argument("--enable_p2", action="store_true")
     parser.add_argument("--disable_p2", action="store_true")
     parser.add_argument("--disable_p6", action="store_true")
     parser.add_argument("--disable_level_scales", action="store_true")
+    parser.add_argument("--channels", type=int, default=128)
+    parser.add_argument("--enable_bifpn", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume_from_best", action="store_true")
     parser.add_argument("--resume_from_last", action="store_true")
@@ -151,6 +209,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
     step_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    ema: ModelEMA | None = None,
     use_amp: bool = False,
     channels_last: bool = False,
 ) -> dict[str, float]:
@@ -184,6 +243,8 @@ def run_epoch(
                 optimizer.step()
             if step_scheduler is not None and optimizer_stepped:
                 step_scheduler.step()
+            if ema is not None and optimizer_stepped:
+                ema.update(model)
 
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -213,7 +274,6 @@ def evaluate_map(
     }
     pred_by_class: dict[int, list[dict[str, object]]] = {class_id: [] for class_id in range(num_classes)}
     image_index = 0
-    points_cache: dict[tuple[str, int, int], torch.Tensor] = {}
 
     for images, targets in dataloader:
         images = images.to(device, non_blocking=True)
@@ -221,6 +281,9 @@ def evaluate_map(
             images = images.contiguous(memory_format=torch.channels_last)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             outputs = model(images)
+            cls_logits, reg_preds, cnt_logits = flatten_fcos_outputs(outputs)
+            points, strides, _ = make_fcos_points(outputs, device)
+            probs = torch.sigmoid(cls_logits) * torch.sqrt(torch.sigmoid(cnt_logits).clamp(min=0.0)).unsqueeze(-1)
 
         for batch_idx, image_targets in enumerate(targets):
             current_image_index = image_index + batch_idx
@@ -231,62 +294,52 @@ def evaluate_map(
                     {"bbox": torch.tensor([xmin, ymin, xmax, ymax]), "matched": False}
                 )
 
-            image_predictions: list[dict[str, object]] = []
-            for level, (cls_logits, reg_preds, cnt_logits) in outputs.items():
-                stride = LEVEL_SPECS[level]["stride"]
-                cls_scores = torch.sigmoid(cls_logits[batch_idx])
-                cnt_scores = torch.sigmoid(cnt_logits[batch_idx])
-                scores_per_class = torch.sqrt((cls_scores * cnt_scores).clamp(min=0.0))
-                scores, class_ids = scores_per_class.reshape(num_classes, -1).max(dim=0)
-                candidate_indices = torch.arange(scores.numel(), device=device)
-                if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
-                    scores, topk_indices = scores.topk(pre_nms_topk)
-                    class_ids = class_ids[topk_indices]
-                    candidate_indices = topk_indices
-                keep = scores >= conf_threshold
-                if not keep.any():
-                    continue
-                scores = scores[keep]
-                class_ids = class_ids[keep]
-                candidate_indices = candidate_indices[keep]
+            scores, flat_indices = torch.topk(
+                probs[batch_idx].reshape(-1),
+                k=min(pre_nms_topk, probs.shape[1] * probs.shape[2]) if pre_nms_topk > 0 else probs.shape[1] * probs.shape[2],
+            )
+            keep = scores >= conf_threshold
+            if not keep.any():
+                continue
+            scores = scores[keep]
+            flat_indices = flat_indices[keep]
+            point_indices = flat_indices // num_classes
+            class_ids = flat_indices % num_classes
+            distances = reg_preds[batch_idx, point_indices] * strides[point_indices, None] / img_size
+            selected_points = points[point_indices] / img_size
+            boxes = torch.stack(
+                (
+                    selected_points[:, 0] - distances[:, 0],
+                    selected_points[:, 1] - distances[:, 1],
+                    selected_points[:, 0] + distances[:, 2],
+                    selected_points[:, 1] + distances[:, 3],
+                ),
+                dim=1,
+            ).clamp(0.0, 1.0)
+            valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+            if not valid.any():
+                continue
+            boxes = boxes[valid]
+            scores = scores[valid]
+            class_ids = class_ids[valid]
 
-                _, height, width = cls_logits.shape[1:]
-                cache_key = (level, height, width)
-                if cache_key not in points_cache:
-                    shifts_x = (torch.arange(width, device=device, dtype=torch.float32) + 0.5) * stride / img_size
-                    shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride / img_size
-                    yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
-                    points_cache[cache_key] = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
-                points = points_cache[cache_key][candidate_indices]
-                distances = reg_preds[batch_idx].permute(1, 2, 0).reshape(-1, 4)[candidate_indices] * stride / img_size
-                boxes = torch.stack(
-                    (
-                        points[:, 0] - distances[:, 0],
-                        points[:, 1] - distances[:, 1],
-                        points[:, 0] + distances[:, 2],
-                        points[:, 1] + distances[:, 3],
-                    ),
-                    dim=1,
-                ).clamp(0.0, 1.0)
-
-                for class_id in class_ids.unique():
-                    class_mask = class_ids == class_id
-                    selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
-                    for box, score in zip(boxes[class_mask][selected], scores[class_mask][selected]):
-                        if box[2] <= box[0] or box[3] <= box[1]:
-                            continue
-                        image_predictions.append(
-                            {
-                                "image_id": current_image_index,
-                                "class_id": int(class_id.item()),
-                                "confidence": float(score.item()),
-                                "bbox": box.detach().cpu(),
-                            }
-                        )
-
-            image_predictions.sort(key=lambda item: float(item["confidence"]), reverse=True)
-            for pred in image_predictions[:max_detections_per_image]:
-                pred_by_class[int(pred["class_id"])].append(pred)
+            selected_indices: list[torch.Tensor] = []
+            for class_id in class_ids.unique():
+                class_indices = torch.where(class_ids == class_id)[0]
+                selected_indices.append(class_indices[nms(boxes[class_indices], scores[class_indices], nms_threshold)])
+            if not selected_indices:
+                continue
+            selected = torch.cat(selected_indices)
+            selected = selected[scores[selected].argsort(descending=True)][:max_detections_per_image]
+            for index in selected.tolist():
+                pred_by_class[int(class_ids[index].item())].append(
+                    {
+                        "image_id": current_image_index,
+                        "class_id": int(class_ids[index].item()),
+                        "confidence": float(scores[index].item()),
+                        "bbox": boxes[index].detach().cpu(),
+                    }
+                )
 
         image_index += images.shape[0]
 
@@ -366,14 +419,20 @@ def save_checkpoint(
     use_p2: bool,
     use_p6: bool,
     use_scales: bool,
+    channels: int,
+    use_bifpn: bool,
+    ema: ModelEMA | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
+    model_to_save = unwrap_model(model)
     torch.save(
         {
             "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "ema_state_dict": ema.state_dict() if ema is not None else None,
+            "ema_updates": ema.num_updates if ema is not None else 0,
+            "ema_decay": ema.decay if ema is not None else None,
             "class_names": class_names,
             "img_size": img_size,
             "grid_size": grid_size,
@@ -385,6 +444,8 @@ def save_checkpoint(
             "use_p2": use_p2,
             "use_p6": use_p6,
             "use_scales": use_scales,
+            "channels": channels,
+            "use_bifpn": use_bifpn,
         },
         path,
     )
@@ -395,17 +456,21 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     args = parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
     device = torch.device(args.device)
     use_p2 = args.enable_p2 and not args.disable_p2
     use_p6 = not args.disable_p6 and not use_p2
     use_scales = not args.disable_level_scales
+    use_bifpn = args.enable_bifpn
     if use_p2:
         model_type = MODEL_TYPE_P2
-    elif use_p6 or use_scales:
+    elif use_p6 or use_scales or not use_bifpn or args.channels != 256:
         model_type = MODEL_TYPE_P6_SCALE
     else:
         model_type = MODEL_TYPE_BASE
     if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -454,7 +519,8 @@ def main() -> None:
     if args.num_workers > 0:
         loader_options["prefetch_factor"] = 2
     sampler = None
-    if not args.disable_class_aware_sampler:
+    use_class_aware_sampler = args.enable_class_aware_sampler and not args.disable_class_aware_sampler
+    if use_class_aware_sampler:
         sampler = WeightedRandomSampler(
             weights=image_sampling_weights(train_dataset),
             num_samples=len(train_dataset),
@@ -468,7 +534,7 @@ def main() -> None:
         sampler=sampler,
         **loader_options,
     )
-    val_batch_size = args.val_batch_size or args.batch_size
+    val_batch_size = args.val_batch_size or max(1, min(args.batch_size, 16))
     val_loader = DataLoader(
         val_dataset,
         batch_size=val_batch_size,
@@ -482,15 +548,26 @@ def main() -> None:
         use_p2=use_p2,
         use_p6=use_p6,
         use_scales=use_scales,
+        channels=args.channels,
+        use_bifpn=use_bifpn,
     ).to(device)
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     gpu_count = torch.cuda.device_count() if device.type == "cuda" else 0
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model_state_dict"])
+    ema = None if args.disable_ema else ModelEMA(model, decay=args.ema_decay)
+    if ema is not None and checkpoint is not None and checkpoint.get("ema_state_dict") is not None:
+        ema.load_state_dict(
+            checkpoint["ema_state_dict"],
+            num_updates=int(checkpoint.get("ema_updates", 0)),
+        )
     if gpu_count > 1 and not args.single_gpu:
         model = torch.nn.DataParallel(model)
-    class_weights = class_weights_from_dataset(train_dataset, args.chair_loss_boost).to(device)
+    if args.enable_class_weights or args.chair_loss_boost != 1.0:
+        class_weights = class_weights_from_dataset(train_dataset, args.chair_loss_boost).to(device)
+    else:
+        class_weights = torch.ones(len(train_dataset.class_names), dtype=torch.float32, device=device)
     criterion = DetectionLoss(
         img_size=args.img_size,
         grid_size=args.img_size // 32,
@@ -559,6 +636,8 @@ def main() -> None:
         f"use_p2={use_p2} "
         f"use_p6={use_p6} "
         f"use_scales={use_scales} "
+        f"channels={args.channels} "
+        f"use_bifpn={use_bifpn} "
         f"pretrained_backbone=True "
         f"multi_scale=True "
         f"eval_map=True "
@@ -567,10 +646,15 @@ def main() -> None:
         f"skip_val_loss={args.skip_val_loss or args.scheduler == 'onecycle'} "
         f"amp={use_amp} "
         f"channels_last={channels_last} "
+        f"ema={ema is not None} "
+        f"ema_decay={(ema.decay if ema is not None else 0.0):.5f} "
         f"class_aware_sampler={sampler is not None} "
+        f"class_weights={args.enable_class_weights or args.chair_loss_boost != 1.0} "
         f"chair_loss_boost={args.chair_loss_boost} "
         f"map_pre_nms_topk={args.map_pre_nms_topk} "
         f"early_stopping_patience={args.early_stopping_patience} "
+        f"min_epochs={args.min_epochs} "
+        f"seed={args.seed} "
         f"train_images={len(train_dataset)} "
         f"val_images={len(val_dataset)} "
         f"best_checkpoint={best_path} "
@@ -594,6 +678,7 @@ def main() -> None:
             optimizer,
             scaler=scaler,
             step_scheduler=scheduler if args.scheduler == "onecycle" else None,
+            ema=ema,
             use_amp=use_amp,
             channels_last=channels_last,
         )
@@ -605,56 +690,66 @@ def main() -> None:
             val_dataset.transform.img_size = args.img_size
             criterion.img_size = args.img_size
             criterion.grid_size = args.img_size // 32
-            should_run_val_loss = not args.skip_val_loss and args.scheduler == "plateau"
-            if should_run_val_loss:
-                with torch.no_grad():
-                    val_metrics = run_epoch(
-                        model,
-                        val_loader,
-                        criterion,
-                        device,
-                        use_amp=use_amp,
-                        channels_last=channels_last,
-                    )
-                val_loss = val_metrics["loss"]
-                scheduler.step(val_loss)
-            map_metrics = evaluate_map(
-                model=model,
-                dataloader=val_loader,
-                num_classes=len(train_dataset.class_names),
-                img_size=args.img_size,
-                device=device,
-                conf_threshold=args.map_conf_threshold,
-                nms_threshold=args.map_nms_threshold,
-                max_detections_per_image=args.map_max_detections_per_image,
-                pre_nms_topk=args.map_pre_nms_topk,
-                use_amp=use_amp,
-                channels_last=channels_last,
-            )
-
-            improved = map_metrics["map_50"] > best_map
-            if improved:
-                best_val_loss = val_loss
-                best_map = map_metrics["map_50"]
-                epochs_without_improvement = 0
-                save_checkpoint(
-                    best_path,
-                    model,
-                    optimizer,
-                    scheduler,
-                    train_dataset.class_names,
-                    args.img_size,
-                    args.img_size // 32,
-                    epoch,
-                    best_val_loss,
-                    best_metric=best_map,
-                    model_type=model_type,
-                    use_p2=use_p2,
-                    use_p6=use_p6,
-                    use_scales=use_scales,
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
+            try:
+                should_run_val_loss = not args.skip_val_loss and args.scheduler == "plateau"
+                if should_run_val_loss:
+                    with torch.no_grad():
+                        val_metrics = run_epoch(
+                            model,
+                            val_loader,
+                            criterion,
+                            device,
+                            use_amp=use_amp,
+                            channels_last=channels_last,
+                        )
+                    val_loss = val_metrics["loss"]
+                    scheduler.step(val_loss)
+                map_metrics = evaluate_map(
+                    model=model,
+                    dataloader=val_loader,
+                    num_classes=len(train_dataset.class_names),
+                    img_size=args.img_size,
+                    device=device,
+                    conf_threshold=args.map_conf_threshold,
+                    nms_threshold=args.map_nms_threshold,
+                    max_detections_per_image=args.map_max_detections_per_image,
+                    pre_nms_topk=args.map_pre_nms_topk,
+                    use_amp=use_amp,
+                    channels_last=channels_last,
                 )
-            else:
-                epochs_without_improvement += 1
+
+                improved = map_metrics["map_50"] > best_map
+                if improved:
+                    best_val_loss = val_loss
+                    best_map = map_metrics["map_50"]
+                    epochs_without_improvement = 0
+                    save_checkpoint(
+                        best_path,
+                        model,
+                        optimizer,
+                        scheduler,
+                        train_dataset.class_names,
+                        args.img_size,
+                        args.img_size // 32,
+                        epoch,
+                        best_val_loss,
+                        best_metric=best_map,
+                        model_type=model_type,
+                        use_p2=use_p2,
+                        use_p6=use_p6,
+                        use_scales=use_scales,
+                        channels=args.channels,
+                        use_bifpn=use_bifpn,
+                        ema=ema,
+                    )
+                else:
+                    epochs_without_improvement += 1
+            finally:
+                if ema is not None:
+                    ema.restore(model)
         else:
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -673,6 +768,9 @@ def main() -> None:
             use_p2=use_p2,
             use_p6=use_p6,
             use_scales=use_scales,
+            channels=args.channels,
+            use_bifpn=use_bifpn,
+            ema=ema,
         )
 
         message = (
@@ -699,7 +797,11 @@ def main() -> None:
         message += f" epoch_time={format_duration(time.perf_counter() - epoch_start_time)}"
         print(message)
 
-        if map_metrics is not None and epochs_without_improvement >= args.early_stopping_patience:
+        if (
+            map_metrics is not None
+            and epoch >= args.min_epochs
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
             print(
                 f"Early stopping at epoch={epoch:03d} "
                 f"best_mAP@0.5={best_map:.4f} "

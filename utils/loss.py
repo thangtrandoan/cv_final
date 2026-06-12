@@ -97,6 +97,37 @@ def ciou_loss_from_ltrb(pred: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     return 1.0 - ciou.clamp(min=-1.0, max=1.0)
 
 
+def giou_loss_from_ltrb(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    pred_left, pred_top, pred_right, pred_bottom = pred.unbind(dim=-1)
+    tgt_left, tgt_top, tgt_right, tgt_bottom = target.unbind(dim=-1)
+
+    inter_w = torch.minimum(pred_left, tgt_left) + torch.minimum(pred_right, tgt_right)
+    inter_h = torch.minimum(pred_top, tgt_top) + torch.minimum(pred_bottom, tgt_bottom)
+    inter = inter_w.clamp(min=0.0) * inter_h.clamp(min=0.0)
+
+    pred_area = (pred_left + pred_right).clamp(min=0.0) * (pred_top + pred_bottom).clamp(min=0.0)
+    target_area = (tgt_left + tgt_right).clamp(min=0.0) * (tgt_top + tgt_bottom).clamp(min=0.0)
+    union = pred_area + target_area - inter
+    iou = inter / union.clamp(min=1e-6)
+
+    pred_x1 = -pred_left
+    pred_y1 = -pred_top
+    pred_x2 = pred_right
+    pred_y2 = pred_bottom
+    tgt_x1 = -tgt_left
+    tgt_y1 = -tgt_top
+    tgt_x2 = tgt_right
+    tgt_y2 = tgt_bottom
+
+    enc_x1 = torch.minimum(pred_x1, tgt_x1)
+    enc_y1 = torch.minimum(pred_y1, tgt_y1)
+    enc_x2 = torch.maximum(pred_x2, tgt_x2)
+    enc_y2 = torch.maximum(pred_y2, tgt_y2)
+    enc_area = (enc_x2 - enc_x1).clamp(min=0.0) * (enc_y2 - enc_y1).clamp(min=0.0)
+    giou = iou - (enc_area - union) / enc_area.clamp(min=1e-6)
+    return 1.0 - giou.clamp(min=-1.0, max=1.0)
+
+
 def encode_fcos_targets(
     outputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     targets: list[list[dict[str, Any]]],
@@ -176,6 +207,120 @@ def encode_fcos_targets(
     return encoded
 
 
+def flatten_fcos_outputs(
+    outputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cls_logits = torch.cat(
+        [item[0].permute(0, 2, 3, 1).reshape(item[0].shape[0], -1, item[0].shape[1]) for item in outputs.values()],
+        dim=1,
+    )
+    reg_preds = torch.cat(
+        [item[1].permute(0, 2, 3, 1).reshape(item[1].shape[0], -1, 4) for item in outputs.values()],
+        dim=1,
+    )
+    cnt_logits = torch.cat(
+        [item[2].permute(0, 2, 3, 1).reshape(item[2].shape[0], -1) for item in outputs.values()],
+        dim=1,
+    )
+    return cls_logits, reg_preds, cnt_logits
+
+
+def make_fcos_points(
+    outputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    active_levels = set(outputs)
+    points_by_level = []
+    strides_by_level = []
+    ranges_by_level = []
+    for level, (cls_logits, _, _) in outputs.items():
+        _, _, height, width = cls_logits.shape
+        spec = level_spec_for(level, active_levels)
+        stride = float(spec["stride"])
+        shifts_x = (torch.arange(width, device=device, dtype=torch.float32) + 0.5) * stride
+        shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride
+        yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
+        points = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+        points_by_level.append(points)
+        strides_by_level.append(torch.full((points.shape[0],), stride, device=device))
+        ranges_by_level.append(
+            torch.tensor([spec["min_size"], spec["max_size"]], device=device, dtype=torch.float32)
+            .view(1, 2)
+            .expand(points.shape[0], 2)
+        )
+    return torch.cat(points_by_level), torch.cat(strides_by_level), torch.cat(ranges_by_level)
+
+
+def encode_fcos_targets_flat(
+    outputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    targets: list[list[dict[str, Any]]],
+    num_classes: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    points, strides, reg_ranges = make_fcos_points(outputs, device)
+    batch_size = len(targets)
+    num_points = points.shape[0]
+    labels = torch.full((batch_size, num_points), -1, dtype=torch.long, device=device)
+    reg_targets = torch.zeros((batch_size, num_points, 4), dtype=torch.float32, device=device)
+    cnt_targets = torch.zeros((batch_size, num_points), dtype=torch.float32, device=device)
+
+    xs = points[:, 0]
+    ys = points[:, 1]
+    for batch_idx, image_targets in enumerate(targets):
+        boxes = []
+        gt_labels = []
+        for item in image_targets:
+            xmin, ymin, xmax, ymax = [float(value) for value in item["bbox"]]
+            if xmax <= xmin or ymax <= ymin:
+                continue
+            class_id = int(item["class_id"])
+            if 0 <= class_id < num_classes:
+                boxes.append([xmin, ymin, xmax, ymax])
+                gt_labels.append(class_id)
+        if not boxes:
+            continue
+
+        box_tensor = torch.tensor(boxes, dtype=torch.float32, device=device)
+        label_tensor = torch.tensor(gt_labels, dtype=torch.long, device=device)
+        left = xs[:, None] - box_tensor[None, :, 0]
+        top = ys[:, None] - box_tensor[None, :, 1]
+        right = box_tensor[None, :, 2] - xs[:, None]
+        bottom = box_tensor[None, :, 3] - ys[:, None]
+        reg = torch.stack((left, top, right, bottom), dim=2)
+        inside_box = reg.min(dim=2).values > 0
+
+        centers = (box_tensor[:, :2] + box_tensor[:, 2:]) * 0.5
+        radius = strides[:, None] * 1.5
+        center_x1 = torch.maximum(box_tensor[None, :, 0], centers[None, :, 0] - radius)
+        center_y1 = torch.maximum(box_tensor[None, :, 1], centers[None, :, 1] - radius)
+        center_x2 = torch.minimum(box_tensor[None, :, 2], centers[None, :, 0] + radius)
+        center_y2 = torch.minimum(box_tensor[None, :, 3], centers[None, :, 1] + radius)
+        inside_center = (
+            (xs[:, None] >= center_x1)
+            & (xs[:, None] <= center_x2)
+            & (ys[:, None] >= center_y1)
+            & (ys[:, None] <= center_y2)
+        )
+
+        max_reg = reg.max(dim=2).values
+        in_range = (max_reg >= reg_ranges[:, None, 0]) & (max_reg <= reg_ranges[:, None, 1])
+        areas = (
+            (box_tensor[:, 2] - box_tensor[:, 0]) * (box_tensor[:, 3] - box_tensor[:, 1])
+        )[None, :].expand(num_points, len(boxes)).clone()
+        areas[~(inside_box & inside_center & in_range)] = float("inf")
+        min_area, min_indices = areas.min(dim=1)
+        pos = torch.isfinite(min_area)
+        if not pos.any():
+            continue
+
+        matched = min_indices[pos]
+        labels[batch_idx, pos] = label_tensor[matched]
+        reg_targets[batch_idx, pos] = reg[pos, matched] / strides[pos, None]
+        cnt_targets[batch_idx, pos] = centerness_from_ltrb(reg_targets[batch_idx, pos])
+
+    return labels, reg_targets, cnt_targets
+
+
 class DetectionLoss(nn.Module):
     def __init__(
         self,
@@ -205,48 +350,45 @@ class DetectionLoss(nn.Module):
         outputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         targets: list[list[dict[str, Any]]],
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        encoded = encode_fcos_targets(outputs, targets, self.img_size, self.num_classes, next(iter(outputs.values()))[0].device)
+        device = next(iter(outputs.values()))[0].device
+        cls_logits, reg_preds, cnt_logits = flatten_fcos_outputs(outputs)
+        labels, reg_targets, cnt_targets = encode_fcos_targets_flat(outputs, targets, self.num_classes, device)
 
-        total_cls_loss = next(iter(outputs.values()))[0].sum() * 0.0
-        total_box_loss = total_cls_loss.clone()
-        total_cnt_loss = total_cls_loss.clone()
-        total_pos = 0
-        total_locations = 0
-        pos_cnt_values = []
-        neg_cls_scores = []
+        pos_mask = labels >= 0
+        num_pos = pos_mask.sum().clamp(min=1).float()
+        cls_target = torch.zeros_like(cls_logits)
+        pos_b, pos_i = torch.where(pos_mask)
+        if pos_b.numel():
+            cls_target[pos_b, pos_i, labels[pos_mask]] = 1.0
 
-        for level, (cls_logits, reg_preds, cnt_logits) in outputs.items():
-            target = encoded[level]
-            cls_target = target["cls"]
-            reg_target = target["reg"]
-            cnt_target = target["cnt"]
-            pos_mask = target["pos_mask"]
-            num_pos = int(pos_mask.sum().item())
-            total_pos += num_pos
-            total_locations += pos_mask.numel()
+        bce = F.binary_cross_entropy_with_logits(cls_logits, cls_target, reduction="none")
+        probs = torch.sigmoid(cls_logits)
+        p_t = probs * cls_target + (1.0 - probs) * (1.0 - cls_target)
+        alpha_t = 0.25 * cls_target + 0.75 * (1.0 - cls_target)
+        cls_loss = alpha_t * (1.0 - p_t).pow(2.0) * bce
+        if self.class_weights is not None:
+            class_weights = self.class_weights.view(1, 1, -1).to(device)
+            cls_loss = cls_loss * (1.0 + cls_target * (class_weights - 1.0))
+        total_cls_loss = cls_loss.sum() / num_pos
 
-            cls_loss = focal_loss(cls_logits, cls_target, class_weights=self.class_weights).sum() / max(num_pos, 1)
-            total_cls_loss = total_cls_loss + cls_loss
+        if pos_b.numel():
+            pred_ltrb = reg_preds[pos_b, pos_i]
+            target_ltrb = reg_targets[pos_b, pos_i]
+            cnt_weights = cnt_targets[pos_b, pos_i].detach()
+            total_box_loss = (
+                giou_loss_from_ltrb(pred_ltrb, target_ltrb) * cnt_weights
+            ).sum() / cnt_weights.sum().clamp(min=1e-6)
+            total_cnt_loss = F.binary_cross_entropy_with_logits(
+                cnt_logits[pos_b, pos_i], cnt_targets[pos_b, pos_i], reduction="sum"
+            ) / num_pos
+            pos_conf = torch.sigmoid(cnt_logits[pos_b, pos_i]).detach().mean()
+        else:
+            total_box_loss = reg_preds.sum() * 0.0
+            total_cnt_loss = cnt_logits.sum() * 0.0
+            pos_conf = total_box_loss.detach()
 
-            if num_pos:
-                pos = pos_mask.squeeze(1)
-                pred_ltrb = reg_preds.permute(0, 2, 3, 1)[pos]
-                target_ltrb = reg_target.permute(0, 2, 3, 1)[pos]
-                cnt_weights = cnt_target.squeeze(1)[pos].detach()
-                box_loss = (ciou_loss_from_ltrb(pred_ltrb, target_ltrb) * cnt_weights).sum() / cnt_weights.sum().clamp(min=1.0)
-                cnt_loss = F.binary_cross_entropy_with_logits(cnt_logits.squeeze(1)[pos], cnt_target.squeeze(1)[pos], reduction="mean")
-                pos_cnt_values.append(torch.sigmoid(cnt_logits.squeeze(1)[pos]).detach())
-            else:
-                box_loss = reg_preds.sum() * 0.0
-                cnt_loss = cnt_logits.sum() * 0.0
-
-            total_box_loss = total_box_loss + box_loss
-            total_cnt_loss = total_cnt_loss + cnt_loss
-            neg_cls_scores.append(torch.sigmoid(cls_logits[~pos_mask.expand_as(cls_logits)]).detach())
-
+        neg_conf = probs[~pos_mask].detach().mean() if (~pos_mask).any() else probs.detach().mean()
         loss = self.lambda_cls * total_cls_loss + self.lambda_box * total_box_loss + self.lambda_obj * total_cnt_loss
-        pos_conf = torch.cat(pos_cnt_values).mean() if pos_cnt_values else loss.new_tensor(0.0)
-        neg_conf = torch.cat(neg_cls_scores).mean() if neg_cls_scores else loss.new_tensor(0.0)
         metrics = {
             "loss": float(loss.detach().cpu()),
             "box_loss": float(total_box_loss.detach().cpu()),
@@ -255,8 +397,8 @@ class DetectionLoss(nn.Module):
             "cls_loss": float(total_cls_loss.detach().cpu()),
             "obj_conf": float(pos_conf.detach().cpu()),
             "noobj_conf": float(neg_conf.detach().cpu()),
-            "num_pos": float(total_pos),
-            "pos_ratio": float(total_pos / max(total_locations, 1)),
+            "num_pos": float(pos_mask.sum().detach().cpu()),
+            "pos_ratio": float(pos_mask.float().mean().detach().cpu()),
         }
         return loss, metrics
 

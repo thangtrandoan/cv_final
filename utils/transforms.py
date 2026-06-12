@@ -9,7 +9,7 @@ from PIL import Image, ImageEnhance
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
-LETTERBOX_FILL = tuple(int(round(value * 255)) for value in (0.485, 0.456, 0.406))
+LETTERBOX_FILL = (114, 114, 114)
 
 
 class DetectionTransform:
@@ -18,7 +18,7 @@ class DetectionTransform:
         img_size: int = 416,
         train: bool = True,
         hflip_prob: float = 0.5,
-        color_jitter: float = 0.15,
+        color_jitter: float = 1.0,
     ) -> None:
         self.img_size = img_size
         self.train = train
@@ -65,9 +65,9 @@ class DetectionTransform:
         return canvas, scale, pad_x, pad_y
 
     def _color_jitter(self, image: Image.Image) -> Image.Image:
-        for enhancer_cls in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
-            factor = 1.0 + random.uniform(-self.color_jitter, self.color_jitter)
-            image = enhancer_cls(image).enhance(factor)
+        image = ImageEnhance.Color(image).enhance(random.uniform(0.75, 1.30))
+        image = ImageEnhance.Contrast(image).enhance(random.uniform(0.75, 1.30))
+        image = ImageEnhance.Brightness(image).enhance(random.uniform(0.80, 1.25))
         return image
 
     @staticmethod

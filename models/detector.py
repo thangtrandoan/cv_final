@@ -18,9 +18,10 @@ class ConvBlock(nn.Module):
     ) -> None:
         super().__init__()
         padding = kernel_size // 2
+        num_groups = 16 if out_channels % 16 == 0 else 32
         layers: list[nn.Module] = [
             nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=False),
-            nn.GroupNorm(32, out_channels),
+            nn.GroupNorm(num_groups, out_channels),
             nn.ReLU(inplace=True),
         ]
         if dropout > 0:
@@ -41,19 +42,19 @@ class Scale(nn.Module):
 
 
 class FCOSHead(nn.Module):
-    def __init__(self, in_channels: int = 256, num_classes: int = 5) -> None:
+    def __init__(self, in_channels: int = 128, num_classes: int = 5, dropout: float = 0.0) -> None:
         super().__init__()
         self.cls_tower = nn.Sequential(
-            ConvBlock(in_channels, in_channels, dropout=0.1),
-            ConvBlock(in_channels, in_channels, dropout=0.1),
-            ConvBlock(in_channels, in_channels, dropout=0.1),
-            ConvBlock(in_channels, in_channels, dropout=0.1),
+            ConvBlock(in_channels, in_channels, dropout=dropout),
+            ConvBlock(in_channels, in_channels, dropout=dropout),
+            ConvBlock(in_channels, in_channels, dropout=dropout),
+            ConvBlock(in_channels, in_channels, dropout=dropout),
         )
         self.reg_tower = nn.Sequential(
-            ConvBlock(in_channels, in_channels, dropout=0.1),
-            ConvBlock(in_channels, in_channels, dropout=0.1),
-            ConvBlock(in_channels, in_channels, dropout=0.1),
-            ConvBlock(in_channels, in_channels, dropout=0.1),
+            ConvBlock(in_channels, in_channels, dropout=dropout),
+            ConvBlock(in_channels, in_channels, dropout=dropout),
+            ConvBlock(in_channels, in_channels, dropout=dropout),
+            ConvBlock(in_channels, in_channels, dropout=dropout),
         )
         self.cls_head = nn.Conv2d(in_channels, num_classes, kernel_size=3, padding=1)
         self.reg_head = nn.Conv2d(in_channels, 4, kernel_size=3, padding=1)
@@ -67,7 +68,7 @@ class FCOSHead(nn.Module):
         raw_reg = self.reg_head(reg_features)
         if scale is not None:
             raw_reg = scale(raw_reg)
-        reg_preds = F.softplus(raw_reg)
+        reg_preds = F.relu(raw_reg)
         cnt_logits = self.cnt_head(reg_features)
         return cls_logits, reg_preds, cnt_logits
 
@@ -93,12 +94,16 @@ class TinyGridDetector(nn.Module):
         use_p2: bool = False,
         use_p6: bool = False,
         use_scales: bool = False,
+        channels: int = 128,
+        use_bifpn: bool = False,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.use_p2 = use_p2
         self.use_p6 = use_p6
         self.use_scales = use_scales
+        self.channels = channels
+        self.use_bifpn = use_bifpn
         weights = ResNet50_Weights.DEFAULT if pretrained_backbone else None
         backbone = resnet50(weights=weights)
 
@@ -108,25 +113,26 @@ class TinyGridDetector(nn.Module):
         self.layer3 = backbone.layer3
         self.layer4 = backbone.layer4
 
-        self.p5_conv = nn.Conv2d(2048, 256, kernel_size=1)
-        self.p4_conv = nn.Conv2d(1024, 256, kernel_size=1)
-        self.p3_conv = nn.Conv2d(512, 256, kernel_size=1)
+        self.p5_conv = nn.Conv2d(2048, channels, kernel_size=1)
+        self.p4_conv = nn.Conv2d(1024, channels, kernel_size=1)
+        self.p3_conv = nn.Conv2d(512, channels, kernel_size=1)
         if self.use_p2:
-            self.p2_conv = nn.Conv2d(256, 256, kernel_size=1)
-            self.p2_smooth = ConvBlock(256, 256)
-            self.p3_out_smooth = ConvBlock(256, 256)
-        self.p5_smooth = ConvBlock(256, 256)
-        self.p4_smooth = ConvBlock(256, 256)
-        self.p3_smooth = ConvBlock(256, 256)
-        self.p4_out_smooth = ConvBlock(256, 256)
-        self.p5_out_smooth = ConvBlock(256, 256)
+            self.p2_conv = nn.Conv2d(256, channels, kernel_size=1)
+            self.p2_smooth = ConvBlock(channels, channels)
+            self.p3_out_smooth = ConvBlock(channels, channels)
+        self.p5_smooth = ConvBlock(channels, channels)
+        self.p4_smooth = ConvBlock(channels, channels)
+        self.p3_smooth = ConvBlock(channels, channels)
+        if self.use_bifpn:
+            self.p4_out_smooth = ConvBlock(channels, channels)
+            self.p5_out_smooth = ConvBlock(channels, channels)
         if self.use_p6:
             self.p6_out_smooth = nn.Sequential(
-                nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.GroupNorm(32, 256),
+                nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.GroupNorm(16 if channels % 16 == 0 else 32, channels),
                 nn.ReLU(inplace=True),
             )
-        self.head = FCOSHead(256, num_classes)
+        self.head = FCOSHead(channels, num_classes)
         if self.use_scales:
             self.scales = nn.ModuleDict({level: Scale(1.0) for level in self.level_strides})
 
@@ -150,8 +156,12 @@ class TinyGridDetector(nn.Module):
         else:
             p2_out = None
             p3_out = p3_td
-        p4_out = self.p4_out_smooth(p4_td + F.max_pool2d(p3_out, kernel_size=2, stride=2))
-        p5_out = self.p5_out_smooth(p5_td + F.max_pool2d(p4_out, kernel_size=2, stride=2))
+        if self.use_bifpn:
+            p4_out = self.p4_out_smooth(p4_td + F.max_pool2d(p3_out, kernel_size=2, stride=2))
+            p5_out = self.p5_out_smooth(p5_td + F.max_pool2d(p4_out, kernel_size=2, stride=2))
+        else:
+            p4_out = p4_td
+            p5_out = self.p5_smooth(p5_td)
 
         outputs = {
             "p3": self._head("p3", p3_out),

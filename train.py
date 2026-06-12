@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -20,8 +21,8 @@ MULTI_SCALE_MAX = 512
 EARLY_STOPPING_PATIENCE = 50
 MAP_CONF_THRESHOLD = 0.05
 MAP_NMS_THRESHOLD = 0.45
-MAP_MAX_DETECTIONS_PER_IMAGE = 20
-MAP_PRE_NMS_TOPK = 300
+MAP_MAX_DETECTIONS_PER_IMAGE = 30
+MAP_PRE_NMS_TOPK = 1000
 EVAL_MAP_EVERY = 3
 MODEL_TYPE_BASE = "fcos_resnet50_bifpn"
 MODEL_TYPE_P2 = "fcos_resnet50_bifpn_p2"
@@ -50,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--val_batch_size", type=int)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lambda_noobj", type=float, default=2.0)
@@ -67,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map_pre_nms_topk", type=int, default=MAP_PRE_NMS_TOPK)
     parser.add_argument("--eval_map_every", type=int, default=EVAL_MAP_EVERY)
     parser.add_argument("--scheduler", choices=("plateau", "onecycle"), default="plateau")
+    parser.add_argument("--skip_val_loss", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_channels_last", action="store_true")
     parser.add_argument("--single_gpu", action="store_true")
@@ -201,6 +204,8 @@ def evaluate_map(
     max_detections_per_image: int,
     pre_nms_topk: int,
     iou_threshold: float = 0.5,
+    use_amp: bool = False,
+    channels_last: bool = False,
 ) -> dict[str, float]:
     model.eval()
     gt_by_class: dict[int, dict[int, list[dict[str, object]]]] = {
@@ -212,7 +217,10 @@ def evaluate_map(
 
     for images, targets in dataloader:
         images = images.to(device, non_blocking=True)
-        outputs = model(images)
+        if channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            outputs = model(images)
 
         for batch_idx, image_targets in enumerate(targets):
             current_image_index = image_index + batch_idx
@@ -230,9 +238,17 @@ def evaluate_map(
                 cnt_scores = torch.sigmoid(cnt_logits[batch_idx])
                 scores_per_class = torch.sqrt((cls_scores * cnt_scores).clamp(min=0.0))
                 scores, class_ids = scores_per_class.reshape(num_classes, -1).max(dim=0)
+                candidate_indices = torch.arange(scores.numel(), device=device)
+                if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
+                    scores, topk_indices = scores.topk(pre_nms_topk)
+                    class_ids = class_ids[topk_indices]
+                    candidate_indices = topk_indices
                 keep = scores >= conf_threshold
                 if not keep.any():
                     continue
+                scores = scores[keep]
+                class_ids = class_ids[keep]
+                candidate_indices = candidate_indices[keep]
 
                 _, height, width = cls_logits.shape[1:]
                 cache_key = (level, height, width)
@@ -241,8 +257,8 @@ def evaluate_map(
                     shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride / img_size
                     yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
                     points_cache[cache_key] = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
-                points = points_cache[cache_key]
-                distances = reg_preds[batch_idx].permute(1, 2, 0).reshape(-1, 4) * stride / img_size
+                points = points_cache[cache_key][candidate_indices]
+                distances = reg_preds[batch_idx].permute(1, 2, 0).reshape(-1, 4)[candidate_indices] * stride / img_size
                 boxes = torch.stack(
                     (
                         points[:, 0] - distances[:, 0],
@@ -253,13 +269,6 @@ def evaluate_map(
                     dim=1,
                 ).clamp(0.0, 1.0)
 
-                boxes = boxes[keep]
-                scores = scores[keep]
-                class_ids = class_ids[keep]
-                if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
-                    scores, topk_indices = scores.topk(pre_nms_topk)
-                    boxes = boxes[topk_indices]
-                    class_ids = class_ids[topk_indices]
                 for class_id in class_ids.unique():
                     class_mask = class_ids == class_id
                     selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
@@ -382,6 +391,9 @@ def save_checkpoint(
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     args = parse_args()
     device = torch.device(args.device)
     use_p2 = args.enable_p2 and not args.disable_p2
@@ -456,9 +468,10 @@ def main() -> None:
         sampler=sampler,
         **loader_options,
     )
+    val_batch_size = args.val_batch_size or args.batch_size
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=val_batch_size,
         shuffle=False,
         **loader_options,
     )
@@ -538,6 +551,7 @@ def main() -> None:
         f"device={device} "
         f"epochs={args.epochs} "
         f"batch_size={args.batch_size} "
+        f"val_batch_size={val_batch_size} "
         f"gpus={gpu_count} "
         f"single_gpu={args.single_gpu} "
         f"architecture={model_type} "
@@ -550,6 +564,7 @@ def main() -> None:
         f"eval_map=True "
         f"eval_map_every={args.eval_map_every} "
         f"scheduler={args.scheduler} "
+        f"skip_val_loss={args.skip_val_loss or args.scheduler == 'onecycle'} "
         f"amp={use_amp} "
         f"channels_last={channels_last} "
         f"class_aware_sampler={sampler is not None} "
@@ -590,17 +605,18 @@ def main() -> None:
             val_dataset.transform.img_size = args.img_size
             criterion.img_size = args.img_size
             criterion.grid_size = args.img_size // 32
-            with torch.no_grad():
-                val_metrics = run_epoch(
-                    model,
-                    val_loader,
-                    criterion,
-                    device,
-                    use_amp=use_amp,
-                    channels_last=channels_last,
-                )
-            val_loss = val_metrics["loss"]
-            if args.scheduler == "plateau":
+            should_run_val_loss = not args.skip_val_loss and args.scheduler == "plateau"
+            if should_run_val_loss:
+                with torch.no_grad():
+                    val_metrics = run_epoch(
+                        model,
+                        val_loader,
+                        criterion,
+                        device,
+                        use_amp=use_amp,
+                        channels_last=channels_last,
+                    )
+                val_loss = val_metrics["loss"]
                 scheduler.step(val_loss)
             map_metrics = evaluate_map(
                 model=model,
@@ -612,6 +628,8 @@ def main() -> None:
                 nms_threshold=args.map_nms_threshold,
                 max_detections_per_image=args.map_max_detections_per_image,
                 pre_nms_topk=args.map_pre_nms_topk,
+                use_amp=use_amp,
+                channels_last=channels_last,
             )
 
             improved = map_metrics["map_50"] > best_map
@@ -665,10 +683,10 @@ def main() -> None:
         if map_metrics is not None:
             current_lr = optimizer.param_groups[0]["lr"]
             message += (
-                f"val_loss={val_metrics['loss']:.4f} "
-                f"val_obj_conf={val_metrics['obj_conf']:.4f} "
-                f"val_noobj_conf={val_metrics['noobj_conf']:.4f} "
-                f" val_mAP@0.5={map_metrics['map_50']:.4f} "
+                f"val_loss={(val_metrics['loss'] if val_metrics is not None else float('nan')):.4f} "
+                f"val_obj_conf={(val_metrics['obj_conf'] if val_metrics is not None else float('nan')):.4f} "
+                f"val_noobj_conf={(val_metrics['noobj_conf'] if val_metrics is not None else float('nan')):.4f} "
+                f"val_mAP@0.5={map_metrics['map_50']:.4f} "
                 f"best_mAP@0.5={best_map:.4f} "
                 f"val_precision={map_metrics['micro_precision']:.4f} "
                 f"val_recall={map_metrics['micro_recall']:.4f} "

@@ -1,14 +1,27 @@
-# TinyGridDetector Object Detection
+# FCOS Object Detection
 
-Project nay cai dat mot one-stage detector nho theo huong YOLO-like cho bo du lieu `public`. Mo hinh phat hien 5 lop: `person`, `car`, `dog`, `cat`, `chair`.
+Project nay cai dat mot one-stage object detector tu dau cho 5 lop:
 
-## Cau truc
+- `person`
+- `car`
+- `dog`
+- `cat`
+- `chair`
+
+Code khong dung YOLOv5/v8, Detectron2, MMDetection, Faster R-CNN hay SSD co san. Project dung PyTorch va backbone ResNet50 pretrained lam bo trich xuat dac trung.
+
+## Cai Dat
+
+```bash
+pip install -r requirements.txt
+```
+
+## Cau Truc
 
 ```text
 models/
   detector.py
 utils/
-  anchors.py
   box_ops.py
   dataset.py
   json_utils.py
@@ -20,53 +33,73 @@ predict.py
 requirements.txt
 ```
 
-## Cai dat
+## Du Lieu
 
-```bash
-pip install -r requirements.txt
+Du lieu theo cau truc:
+
+```text
+public/
+  classes.json
+  train/images/
+  val/images/
+  annotations/train.json
+  annotations/val.json
+  tools/evaluate_predictions.py
 ```
 
-## Du lieu
+Annotation dung bbox dang:
 
-Dataset nam trong `public/`:
+```text
+[xmin, ymin, xmax, ymax]
+```
 
-- `public/annotations/train.json`: ground truth train.
-- `public/annotations/val.json`: ground truth validation.
-- `public/train/images`: anh train.
-- `public/val/images`: anh validation.
+Toa do bbox la toa do tren anh goc.
 
-Annotation dung bbox dang `[xmin, ymin, xmax, ymax]`. Dataset co anh khong co object, cac anh nay van duoc dua vao train de model hoc background.
+## Mo Hinh
 
-## Mo hinh
+`TinyGridDetector` la detector anchor-free theo huong FCOS:
 
-`TinyGridDetector` la custom CNN backbone tu cac khoi `Conv2d + BatchNorm2d + LeakyReLU`, theo sau la detection head:
+- Backbone: ResNet50 pretrained.
+- Neck: FPN/BiFPN nhe.
+- Head: classification tower, box regression tower, centerness head.
+- Output moi level gom:
+  - class logits
+  - box distances `[left, top, right, bottom]`
+  - centerness/objectness
 
-- Input: `3 x 416 x 416`
-- Output: `[B, 30, 13, 13]`
-- Grid: `13 x 13`
-- Anchor: `3`
-- Moi anchor du doan: `tx, ty, tw, th, objectness, class_logits`
+Checkpoint moi co the luu them cac tuy chon kien truc:
 
-Project khong dung YOLOv5/v8, Detectron2, MMDetection hay detection model co san trong torchvision.
+- `use_p2`
+- `use_p6`
+- `use_scales`
+- `preprocess`
+- `model_type`
+
+`predict.py` tu doc metadata trong checkpoint de khoi tao dung kien truc.
+
+## Tien Xu Ly Va Augment
+
+Pipeline du lieu co:
+
+- Doc JSON annotation va nhieu object trong mot anh.
+- Letterbox resize de giu ti le anh.
+- Normalize theo ImageNet mean/std.
+- Horizontal flip.
+- Color jitter.
+- Multi-scale training.
 
 ## Loss
 
-Loss gom:
+Loss gom cac thanh phan:
 
-- SmoothL1 cho bbox tren anchor co object.
-- BCEWithLogits cho objectness.
-- BCEWithLogits cho no-object voi trong so nho hon.
-- CrossEntropy cho class, co class weight tinh tu tap train.
-
-Tong loss:
-
-```text
-loss = 5.0 * box_loss + 1.0 * obj_loss + 0.3 * noobj_loss + 1.0 * cls_loss
-```
+- Focal loss cho classification.
+- CIoU loss cho box regression.
+- BCEWithLogits cho centerness.
+- Class weight tu thong ke tap train, co boost nhe cho `chair`.
 
 ## Train
 
-Lenh theo yeu cau:
+Lenh bat buoc theo de bai:
 
 ```bash
 python train.py \
@@ -77,38 +110,101 @@ python train.py \
   --checkpoint_dir ./models/
 ```
 
-Co the them KMeans anchors:
+Checkpoint tot nhat duoc luu tai:
+
+```text
+./models/best.pth
+```
+
+Checkpoint moi nhat duoc luu tai:
+
+```text
+./models/last.pth
+```
+
+Resume:
+
+```bash
+python train.py ... --resume_from_best
+python train.py ... --resume_from_last
+```
+
+Lenh train khuyen dung tren Kaggle:
 
 ```bash
 python train.py \
-  --train_data ./public/annotations/train.json \
-  --val_data ./public/annotations/val.json \
-  --image_dir ./public/train/images \
-  --val_image_dir ./public/val/images \
+  --train_data /kaggle/input/datasets/trandthang/final-public/public/annotations/train.json \
+  --val_data /kaggle/input/datasets/trandthang/final-public/public/annotations/val.json \
+  --image_dir /kaggle/input/datasets/trandthang/final-public/public/train/images \
+  --val_image_dir /kaggle/input/datasets/trandthang/final-public/public/val/images \
   --checkpoint_dir ./models/ \
-  --use_kmeans_anchors
+  --img_size 640 \
+  --batch_size 16 \
+  --val_batch_size 32 \
+  --lr 1.5e-4 \
+  --scheduler onecycle \
+  --eval_map_every 5 \
+  --early_stopping_patience 10
 ```
 
-Checkpoint tot nhat duoc luu tai `models/best.pth` va gom `model_state_dict`, `class_names`, `anchors`, `img_size`, `grid_size`, `best_metric`.
+Neu can quay ve baseline cu:
+
+```bash
+--disable_p6 --disable_level_scales
+```
 
 ## Predict
 
-Lenh theo yeu cau:
+Lenh bat buoc theo de bai:
+
+```bash
+python predict.py \
+  --image_dir /path/to/images \
+  --output predictions.json
+```
+
+Mac dinh:
+
+- `--checkpoint ./models/best.pth`
+- `--conf_threshold 0.05`
+- `--max_detections_per_image 30`
+- TTA bat mac dinh
+
+Co the tat TTA de chay nhanh:
 
 ```bash
 python predict.py \
   --image_dir ./public/val/images \
-  --output val_predictions.json
+  --output val_predictions.json \
+  --disable_tta
 ```
 
-Default:
+## Output
 
-- `--checkpoint ./models/best.pth`
-- `--img_size 416`
-- `--conf_threshold 0.20`
-- `--nms_threshold 0.50`
+`predictions.json` la mot mang JSON:
 
-Output la JSON co du moi anh trong `image_dir`. Anh khong co detection se co `"boxes": []`. Bbox duoc scale nguoc ve toa do anh goc.
+```json
+[
+  {
+    "image_id": "example.jpg",
+    "boxes": [
+      {
+        "class": "person",
+        "confidence": 0.91,
+        "bbox": [48, 72, 210, 356]
+      }
+    ]
+  }
+]
+```
+
+Moi anh trong `image_dir` deu co mot phan tu output. Anh khong co detection se co:
+
+```json
+{"image_id": "example.jpg", "boxes": []}
+```
+
+NMS duoc cai dat trong `utils/nms.py` va duoc chay rieng theo tung class.
 
 ## Evaluate
 
@@ -118,5 +214,3 @@ python public/tools/evaluate_predictions.py \
   --predictions val_predictions.json \
   --output val_score.json
 ```
-
-NMS duoc chay rieng theo tung class de tranh loai nham box khac lop.

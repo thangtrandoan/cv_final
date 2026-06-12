@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
@@ -113,16 +114,24 @@ def predict_image(
         cnt_scores = torch.sigmoid(cnt_logits[0])
         scores_per_class = torch.sqrt((cls_scores * cnt_scores).clamp(min=0.0))
         scores, class_ids = scores_per_class.reshape(len(class_names), -1).max(dim=0)
+        candidate_indices = torch.arange(scores.numel(), device=device)
+        if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
+            scores, topk_indices = scores.topk(pre_nms_topk)
+            class_ids = class_ids[topk_indices]
+            candidate_indices = topk_indices
         keep = scores >= conf_threshold
         if not keep.any():
             continue
+        scores = scores[keep]
+        class_ids = class_ids[keep]
+        candidate_indices = candidate_indices[keep]
 
         _, height, width = cls_logits.shape[1:]
         shifts_x = (torch.arange(width, device=device, dtype=torch.float32) + 0.5) * stride
         shifts_y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) * stride
         yy, xx = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
-        points = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
-        distances = reg_preds[0].permute(1, 2, 0).reshape(-1, 4) * stride
+        points = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)[candidate_indices]
+        distances = reg_preds[0].permute(1, 2, 0).reshape(-1, 4)[candidate_indices] * stride
         boxes = torch.stack(
             (
                 points[:, 0] - distances[:, 0],
@@ -146,13 +155,6 @@ def predict_image(
         boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(max=original_w)
         boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(max=original_h)
 
-        boxes = boxes[keep]
-        scores = scores[keep]
-        class_ids = class_ids[keep]
-        if pre_nms_topk > 0 and scores.numel() > pre_nms_topk:
-            scores, topk_indices = scores.topk(pre_nms_topk)
-            boxes = boxes[topk_indices]
-            class_ids = class_ids[topk_indices]
         for class_id in class_ids.unique():
             class_mask = class_ids == class_id
             selected = nms(boxes[class_mask], scores[class_mask], nms_threshold)
@@ -265,6 +267,9 @@ def predict_with_tta(
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     args = parse_args()
     device = torch.device(args.device)
     if device.type == "cuda":

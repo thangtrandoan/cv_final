@@ -64,3 +64,5 @@ weights/
 public/
 
 error_analysis.json
+tmp_predictions_check.json
+tmp_predict_check/

@@ -14,10 +14,11 @@ from utils.loss import flatten_fcos_outputs, make_fcos_points
 from utils.nms import nms
 
 
-TTA_BRIGHTNESS_FACTORS: list[float] = []
+TTA_BRIGHTNESS_FACTORS: list[float] = [0.9, 1.1]
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
 LETTERBOX_FILL = (114, 114, 114)
+TTA_IMAGE_SIZES: list[int] = [640, 512, 704]
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,13 +27,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--checkpoint", type=Path, default=Path("./models/best.pth"))
     parser.add_argument("--img_size", type=int, default=640)
-    parser.add_argument("--conf_threshold", type=float, default=0.005)
-    parser.add_argument("--nms_threshold", type=float, default=0.55)
+    parser.add_argument("--conf_threshold", type=float, default=0.01)
+    parser.add_argument("--nms_threshold", type=float, default=0.6)
     parser.add_argument("--max_detections_per_image", type=int, default=300)
     parser.add_argument("--pre_nms_topk", type=int, default=1500)
     parser.add_argument("--preprocess", choices=("auto", "letterbox", "stretch"), default="auto")
     parser.add_argument("--disable_tta", action="store_true")
-    parser.add_argument("--tta_img_sizes", nargs="*", type=int)
+    parser.add_argument("--tta_img_sizes", nargs="*", type=int, default=TTA_IMAGE_SIZES)
     parser.add_argument("--tta_brightness", nargs="*", type=float, default=TTA_BRIGHTNESS_FACTORS)
     parser.add_argument("--merge_method", choices=("wbf", "nms"), default="wbf")
     parser.add_argument("--wbf_iou_threshold", type=float, default=0.55)

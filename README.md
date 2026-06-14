@@ -1,6 +1,6 @@
 # FCOS Object Detection
 
-Project nay cai dat mot one-stage object detector tu dau cho 5 lop:
+Dự án này cài đặt một one-stage object detector từ đầu cho 5 lớp:
 
 - `person`
 - `car`
@@ -8,15 +8,15 @@ Project nay cai dat mot one-stage object detector tu dau cho 5 lop:
 - `cat`
 - `chair`
 
-Code khong dung YOLOv5/v8, Detectron2, MMDetection, Faster R-CNN hay SSD co san. Project dung PyTorch va backbone ResNet50 pretrained lam bo trich xuat dac trung.
+Code không dùng YOLOv5/v8, Detectron2, MMDetection, Faster R-CNN hay SSD có sẵn. Dự án dùng PyTorch và backbone ResNet50 pretrained làm bộ trích xuất đặc trưng.
 
-## Cai Dat
+## Cài Đặt
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Cau Truc
+## Cấu Trúc
 
 ```text
 models/
@@ -33,9 +33,9 @@ predict.py
 requirements.txt
 ```
 
-## Du Lieu
+## Dữ Liệu
 
-Du lieu theo cau truc:
+Dữ liệu theo cấu trúc:
 
 ```text
 public/
@@ -47,27 +47,27 @@ public/
   tools/evaluate_predictions.py
 ```
 
-Annotation dung bbox dang:
+Annotation dùng bbox dạng:
 
 ```text
 [xmin, ymin, xmax, ymax]
 ```
 
-Toa do bbox la toa do tren anh goc.
+Tọa độ bbox là tọa độ trên ảnh gốc.
 
-## Mo Hinh
+## Mô Hình
 
-`TinyGridDetector` la detector anchor-free theo huong FCOS:
+Detector anchor-free theo hướng FCOS:
 
 - Backbone: ResNet50 pretrained.
-- Neck: FPN nhe, mac dinh co P6 stride 64.
+- Neck: FPN nhẹ, mặc định có P6 stride 64.
 - Head: classification tower, box regression tower, centerness head.
-- Output moi level gom:
+- Output mỗi level gồm:
   - class logits
   - box distances `[left, top, right, bottom]`
   - centerness/objectness
 
-Checkpoint luu them cac tuy chon kien truc:
+Checkpoint lưu thêm các tùy chọn kiến trúc:
 
 - `use_p2`
 - `use_p6`
@@ -77,14 +77,14 @@ Checkpoint luu them cac tuy chon kien truc:
 - `preprocess`
 - `model_type`
 
-`predict.py` tu doc metadata trong checkpoint de khoi tao dung kien truc.
+`predict.py` tự đọc metadata trong checkpoint để khởi tạo đúng kiến trúc.
 
-## Tien Xu Ly Va Augment
+## Tiền Xử Lý Và Augment
 
-Pipeline du lieu co:
+Pipeline dữ liệu có:
 
-- Doc JSON annotation va nhieu object trong mot anh.
-- Letterbox resize de giu ti le anh.
+- Đọc JSON annotation và nhiều object trong một ảnh.
+- Letterbox resize để giữ tỉ lệ ảnh.
 - Normalize theo ImageNet mean/std.
 - Horizontal flip.
 - Color jitter.
@@ -92,16 +92,16 @@ Pipeline du lieu co:
 
 ## Loss
 
-Loss gom cac thanh phan:
+Loss gồm các thành phần:
 
 - Focal loss cho classification.
 - GIoU loss cho box regression.
 - BCEWithLogits cho centerness.
-- Co tuy chon class weight/boost cho `chair`, mac dinh tat de giam bias.
+- Có tùy chọn class weight/boost cho `chair`, mặc định tắt để giảm bias.
 
 ## Train
 
-Lenh bat buoc theo de bai:
+Lệnh bắt buộc theo đề bài:
 
 ```bash
 python train.py \
@@ -112,13 +112,13 @@ python train.py \
   --checkpoint_dir ./models/
 ```
 
-Checkpoint tot nhat duoc luu tai:
+Checkpoint tốt nhất được lưu tại:
 
 ```text
 ./models/best.pth
 ```
 
-Checkpoint moi nhat duoc luu tai:
+Checkpoint mới nhất được lưu tại:
 
 ```text
 ./models/last.pth
@@ -131,7 +131,7 @@ python train.py ... --resume_from_best
 python train.py ... --resume_from_last
 ```
 
-Lenh train khuyen dung tren Kaggle:
+Lệnh train khuyên dùng trên Kaggle:
 
 ```bash
 python train.py \
@@ -151,7 +151,7 @@ python train.py \
   --early_stopping_patience 6
 ```
 
-Mac dinh train moi dung cau hinh toi uu mAP hon:
+Mặc định train mới dùng cấu hình tối ưu mAP hơn:
 
 - `img_size=640`
 - fixed scale `640`
@@ -162,10 +162,10 @@ Mac dinh train moi dung cau hinh toi uu mAP hon:
 - `map_conf_threshold=0.005`
 - `map_pre_nms_topk=1500`
 - `map_max_detections_per_image=300`
-- EMA bat mac dinh, `best.pth` duoc chon/evaluate bang EMA weights
-- khong bat class-aware sampler va class weights mac dinh
+- EMA bật mặc định, `best.pth` được chọn/evaluate bằng EMA weights
+- không bật class-aware sampler và class weights mặc định
 
-Neu can quay ve baseline cu nang hon:
+Nếu cần quay về baseline cũ nặng hơn:
 
 ```bash
 --disable_p6 --disable_level_scales --channels 256 --enable_bifpn
@@ -173,7 +173,7 @@ Neu can quay ve baseline cu nang hon:
 
 ## Predict
 
-Lenh bat buoc theo de bai:
+Lệnh bắt buộc theo đề bài:
 
 ```bash
 python predict.py \
@@ -181,29 +181,28 @@ python predict.py \
   --output predictions.json
 ```
 
-Mac dinh:
+Mặc định:
 
 - `--checkpoint ./models/best.pth`
-- `--conf_threshold 0.005`
+- `--conf_threshold 0.01`
 - `--max_detections_per_image 300`
-- TTA flip ngang bat mac dinh
-- voi checkpoint 640, mac dinh predict dung multi-scale TTA `640` va `704`
-- merge TTA bang weighted box fusion (`--merge_method wbf`)
+- TTA flip ngang và điều chỉnh độ sáng được bật mặc định.
+- Mặc định suy luận bằng multi-scale TTA với các kích thước: `640`, `512`, và `704`.
+- Merge TTA bằng weighted box fusion (`--merge_method wbf`).
 
-Co the tat TTA hoac chay mot scale de nhanh hon:
+Có thể tắt TTA để chạy nhanh hơn:
 
 ```bash
 python predict.py \
   --image_dir ./public/val/images \
   --output val_predictions.json \
   --disable_tta \
-  --tta_img_sizes 640 \
-  --merge_method nms
+  --img_size 640
 ```
 
 ## Output
 
-`predictions.json` la mot mang JSON:
+`predictions.json` là một mảng JSON:
 
 ```json
 [
@@ -220,13 +219,13 @@ python predict.py \
 ]
 ```
 
-Moi anh trong `image_dir` deu co mot phan tu output. Anh khong co detection se co:
+Mỗi ảnh trong `image_dir` đều có một phần tử output. Ảnh không có detection sẽ có:
 
 ```json
 {"image_id": "example.jpg", "boxes": []}
 ```
 
-NMS duoc cai dat trong `utils/nms.py` va duoc chay rieng theo tung class.
+NMS được cài đặt trong `utils/nms.py` và được chạy riêng theo từng class.
 
 ## Evaluate
 

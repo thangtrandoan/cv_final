@@ -89,7 +89,6 @@ class TinyGridDetector(nn.Module):
     def __init__(
         self,
         num_classes: int = 5,
-        num_anchors: int = 3,
         pretrained_backbone: bool = True,
         use_p2: bool = False,
         use_p6: bool = False,

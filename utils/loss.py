@@ -324,7 +324,6 @@ def encode_fcos_targets_flat(
 class DetectionLoss(nn.Module):
     def __init__(
         self,
-        anchors: torch.Tensor | None = None,
         img_size: int = 416,
         grid_size: int = 13,
         num_classes: int = 5,
